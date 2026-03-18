@@ -57,3 +57,10 @@ go build -o title_scraper title_scraper.go
 go build -o link_only_scraper link_only_scraper.go
 go build -o unified_scraper unified_scraper.go
 ```
+
+---
+
+## Credits
+Special thanks to the original contributors and developers:
+- **Taro** (@taro544)
+- **Darkspider**
