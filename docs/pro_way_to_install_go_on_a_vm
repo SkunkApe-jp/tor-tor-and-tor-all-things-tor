@@ -1,0 +1,40 @@
+**Yes, exactly.** If you run those commands, the VM will have its own Go compiler, and you can build the code right there.
+
+However, there is one "gotcha" with `apt`: the version of Go in the standard Linux repositories is often **very old** (e.g., Go 1.18), and the `playwright-go` library usually requires a newer version (Go 1.22 or 1.23).
+
+### The "Pro" way to install Go on Linux (if you want to build on the VM):
+
+If `sudo apt install golang` gives you an error saying your Go version is too old, use this 3-line script to install the latest version:
+
+```bash
+# 1. Download latest Go (1.23.0)
+wget https://go.dev/dl/go1.23.0.linux-amd64.tar.gz
+
+# 2. Extract it to /usr/local
+sudo tar -C /usr/local -xzf go1.23.0.linux-amd64.tar.gz
+
+# 3. Add it to your PATH (so you can run 'go')
+echo "export PATH=\$PATH:/usr/local/go/bin" >> ~/.bashrc
+source ~/.bashrc
+```
+
+---
+
+### Once Go is installed, here is how you build your script on the VM:
+
+1.  **Transfer your files:** Upload `main.go`, `go.mod`, and `go.sum` to a folder on the VM.
+2.  **Download Dependencies:** 
+    Run: `go mod tidy` 
+    *(This tells Go to go get the Playwright library and other tools).*
+3.  **Build:**
+    Run: `go build -o scraper_pro`
+4.  **Install the Browser:**
+    Run: `./scraper_pro install --with-deps firefox`
+5.  **Run:**
+    Run: `./scraper_pro`
+
+### Which way is better?
+*   **Building on your Workstation and uploading the binary** is usually faster because your workstation is likely more powerful than the VM.
+*   **Building on the VM** is easier if you plan on making small changes to the code while testing it on the VM.
+
+**Try running `go version` after you do the `apt install`. If it says `go 1.22` or higher, you are good to go!** If it's 1.18 or 1.19, you might need to use the `wget` method above.

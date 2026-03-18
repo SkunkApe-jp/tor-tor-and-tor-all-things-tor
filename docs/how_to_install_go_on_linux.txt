@@ -1,0 +1,81 @@
+# How to Install Go on a Fresh Linux Machine
+
+## Method 1: Using Package Manager (Recommended for beginners)
+
+### Ubuntu/Debian:
+```bash
+sudo apt update
+sudo apt install golang-go
+```
+
+### CentOS/RHEL/Fedora:
+```bash
+# For newer versions (dnf)
+sudo dnf install golang
+
+# For older versions (yum)
+sudo yum install golang
+```
+
+## Method 2: Manual Installation (Latest version)
+
+### Step 1: Download Go
+Visit https://golang.org/dl/ to find the latest version, then:
+
+```bash
+# Replace VERSION with the latest version (e.g., 1.22.0)
+wget https://golang.org/dl/go1.22.0.linux-amd64.tar.gz
+```
+
+### Step 2: Remove any previous Go installation
+```bash
+sudo rm -rf /usr/local/go
+```
+
+### Step 3: Extract the archive
+```bash
+sudo tar -C /usr/local -xzf go1.22.0.linux-amd64.tar.gz
+```
+
+### Step 4: Set up environment variables
+Add these lines to your ~/.bashrc or ~/.profile:
+```bash
+export PATH=$PATH:/usr/local/go/bin
+export GOPATH=$HOME/go
+export PATH=$PATH:$GOPATH/bin
+```
+
+### Step 5: Reload your profile
+```bash
+source ~/.bashrc
+```
+
+## Verification
+Test your installation:
+```bash
+go version
+```
+
+You should see output similar to:
+```
+go version go1.22.0 linux/amd64
+```
+
+## Setting up Workspace
+Create your Go workspace:
+```bash
+mkdir -p ~/go/{bin,src,pkg}
+```
+
+## Troubleshooting
+- If `go` command is not found, ensure your PATH includes `/usr/local/go/bin`
+- Make sure you're using a 64-bit Linux distribution
+- For ARM processors, download the appropriate ARM version instead of amd64
+
+## Optional: Using Go Modules (Go 1.11+)
+Modern Go development uses modules, which don't require GOPATH:
+```bash
+mkdir myproject
+cd myproject
+go mod init myproject
+```

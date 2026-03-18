@@ -1,0 +1,23 @@
+# IDEs
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+venv2/
+
+# Scraper data & logs
+scraped_data/
+logs/
+*.log
+advanced_sigma_analysis.html
+
+# Go binaries / Built files
+bin/
+*.exe
+
+# Large ML models
+*.gguf

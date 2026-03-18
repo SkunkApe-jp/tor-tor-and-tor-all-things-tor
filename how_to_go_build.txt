@@ -1,0 +1,28 @@
+ From the project root (`/home/kappa/aifiles/tor_scraper1`):
+
+      1 # Build chromedp scripts
+      2 cd go_scripts/chromedp
+      3 go build -o main main.go
+      4 go build -o index index.go
+      5 go build -o failed_scraper failed_scraper.go
+      6 
+      7 # Build playwright scripts
+      8 cd ../playwright
+      9 go build -o playwright_scraper playwright_scraper.go
+     10 go build -o title_scraper title_scraper.go
+     11 go build -o link_only_scraper link_only_scraper.go
+     12 go build -o unified_scraper unified_scraper.go
+
+    Or build all at once from the project root:
+
+     1 cd /home/kappa/aifiles/tor_scraper1
+     2 go build -o bin/chromedp_main ./go_scripts/chromedp/main.go
+     3 go build -o bin/chromedp_index ./go_scripts/chromedp/index.go
+     4 go build -o bin/chromedp_failed ./go_scripts/chromedp/failed_scraper.go
+     5 go build -o bin/playwright_scraper ./go_scripts/playwright/playwright_scraper.go
+     6 go build -o bin/title_scraper ./go_scripts/playwright/title_scraper.go
+     7 go build -o bin/link_only_scraper ./go_scripts/playwright/link_only_scraper.go
+     8 go build -o bin/unified_scraper ./go_scripts/playwright/unified_scraper.go
+
+    Binaries already exist in those directories (e.g., main, index, playwright_scraper), so they may
+    already be built.
