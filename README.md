@@ -63,4 +63,4 @@ go build -o unified_scraper unified_scraper.go
 ## Credits
 Special thanks to the original contributors and developers:
 - **Taro** (@taro544)
-- **Darkspider**
+- **PROxZIMA /DarkSpider**
