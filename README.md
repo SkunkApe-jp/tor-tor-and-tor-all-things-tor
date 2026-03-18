@@ -1,63 +1,59 @@
-# Tor Scraper
+# Tor Scraper Project
 
-A concurrent web scraper for .onion sites using Tor network.
+This project contains several Go-based web scrapers designed to work over a Tor proxy.
 
-## Features
+## Important Note on Executable Location
+The Go scrapers in this project (like `unified_scraper.go`) are hardcoded to look for their configuration files (like `targets.yaml` and `scraped_data/`) **two directories up** by default (`../../`). 
 
-- Scrapes .onion websites through Tor proxy
-- Captures HTML content, screenshots, and extracts links
-- Concurrent processing with 5 workers
-- Automatic Tor connection verification
+**CRITICAL:** If you build the `.exe` file, it **MUST** remain in its original script directory (e.g., `go_scripts/playwright/`) if you run it without flags. If you move the `.exe` to the root folder or a `bin/` folder without specifying the `-targets` and `-output` flags manually, the scraper will fail to find your targets list or create outputs in the wrong place!
 
-## Requirements
+---
 
-- Go 1.19 or higher
-- Tor service running on port 9050
-- Chrome/Chromium browser installed
+## 🪟 Windows Build Instructions
 
-## Installation
+1. **Install Go**: If you haven't already, install Go from [go.dev/dl](https://go.dev/dl/).
+2. **Build the Scraper**:
+   Open PowerShell at the project root (`c:\scraper1`) and run:
+   ```powershell
+   cd go_scripts\playwright
+   go build -o unified_scraper.exe unified_scraper.go
+   ```
+3. **Install Browser Drivers (Required Once)**:
+   The scraper uses Playwright to drive Firefox. You must install the Playwright dependencies:
+   ```powershell
+   go run github.com/playwright-community/playwright-go/cmd/playwright@latest install --with-deps
+   ```
+4. **Run the Scraper**:
+   To run the newly built executable from its correct location:
+   ```powershell
+   cd go_scripts\playwright
+   .\unified_scraper.exe
+   ```
+
+*(Optional)* If you decide you *want* to run the executable from the root folder, you must explicitly pass the paths:
+```powershell
+.\unified_scraper.exe -targets .\targets.yaml -output .\scraped_data
+```
+
+---
+
+## 🐧 Linux / macOS Build Instructions
+
+*(Legacy instructions from `/home/kappa/...`)*
+
+From the project root:
 
 ```bash
-git clone https://github.com/taro544/tor_scraper.git
-cd tor_scraper
-go mod download
+# Build chromedp scripts
+cd go_scripts/chromedp
+go build -o main main.go
+go build -o index index.go
+go build -o failed_scraper failed_scraper.go
+
+# Build playwright scripts
+cd ../playwright
+go build -o playwright_scraper playwright_scraper.go
+go build -o title_scraper title_scraper.go
+go build -o link_only_scraper link_only_scraper.go
+go build -o unified_scraper unified_scraper.go
 ```
-
-## Usage
-
-1. Make sure Tor is running:
-```bash
-# macOS/Linux
-tor
-```
-
-2. Edit `targets.yaml` with your target URLs:
-```yaml
-urls:
-  - example1.onion
-  - example2.onion
-```
-
-3. Build and run:
-```bash
-go build
-./tor-scanner
-```
-
-## Output
-
-All scraped data is saved in `scraped_data/`:
-- `htmls/` - HTML content
-- `images/` - Full-page screenshots
-- `urls/` - Extracted links
-
-## Configuration
-
-Edit constants in `main.go`:
-- `TorProxyServer` - Tor SOCKS5 proxy address (default: 127.0.0.1:9050)
-- `WorkerCount` - Number of concurrent workers (default: 5)
-- `BaseOutputDir` - Output directory (default: scraped_data)
-
-## License
-
-MIT
