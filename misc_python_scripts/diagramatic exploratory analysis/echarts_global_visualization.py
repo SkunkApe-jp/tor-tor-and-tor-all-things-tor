@@ -71,6 +71,11 @@ def generate_echarts_viz(scraped_data_dir):
         if not title:
             title = f"{addr}.onion"
         
+        # Check for site image
+        img_path_rel = f"{addr}/images/index.png"
+        img_path_abs = os.path.join(scraped_data_dir, addr, 'images', 'index.png')
+        has_image = os.path.exists(img_path_abs)
+        
         connected_onions = set()
         for d in ['discovered_links', 'urls']:
             d_path = os.path.join(site_dir, d)
@@ -79,18 +84,25 @@ def generate_echarts_viz(scraped_data_dir):
                     if f.endswith('_links.txt'):
                         connected_onions.update(extract_onion_addresses_from_file(os.path.join(d_path, f)))
         
-        nodes.append({
+        node_entry = {
             "id": addr,
             "name": title,
-            "symbolSize": 15,
+            "symbolSize": 30 if has_image else 15,
             "itemStyle": {"color": "#5470c6"}
-        })
+        }
+        
+        if has_image:
+            # Note: We use the relative path so it works when served
+            node_entry["symbol"] = f"image://{img_path_rel}"
+            node_entry["value"] = img_path_rel # For tooltip access
+        
+        nodes.append(node_entry)
         site_data[addr] = list(connected_onions)
 
     for source, targets in site_data.items():
         for target in targets:
             pure_target = target.replace('.onion', '')
-            if pure_target in site_data:
+            if pure_target in site_data and source != pure_target:
                 links.append({"source": source, "target": pure_target})
 
     html_content = f"""<!DOCTYPE html>
@@ -101,6 +113,8 @@ def generate_echarts_viz(scraped_data_dir):
     <style>
         body, #main {{ width: 100vw; height: 100vh; margin: 0; background: #100c2a; overflow: hidden; }}
         #ui {{ position: absolute; top: 20px; left: 20px; z-index: 10; color: #fff; pointer-events: none; }}
+        .tooltip-card {{ padding: 10px; min-width: 200px; }}
+        .tooltip-img {{ width: 100%; border-radius: 4px; margin-top: 5px; border: 1px solid #444; }}
     </style>
 </head>
 <body>
@@ -116,29 +130,45 @@ def generate_echarts_viz(scraped_data_dir):
 
         const option = {{
             backgroundColor: '#100c2a',
-            tooltip: {{}},
-            legend: [{{
-                data: ['Sites']
-            }}],
+            tooltip: {{
+                trigger: 'item',
+                formatter: function(params) {{
+                    if (params.dataType === 'node') {{
+                        let res = '<div class="tooltip-card">';
+                        res += '<span style="color:#58a6ff; font-weight:bold;">' + params.name + '</span><br/>';
+                        res += '<span style="font-size:11px; opacity:0.7;">' + params.data.id + '.onion</span>';
+                        if (params.data.value) {{
+                            res += '<br/><img src="' + params.data.value + '" class="tooltip-img" />';
+                        }}
+                        res += '</div>';
+                        return res;
+                    }}
+                    return params.name;
+                }},
+                backgroundColor: 'rgba(13, 17, 23, 0.9)',
+                borderColor: '#30363d',
+                textStyle: {{ color: '#fff' }}
+            }},
             series: [
                 {{
-                    name: 'Onion Network',
                     type: 'graph',
                     layout: 'force',
                     data: nodes,
                     links: links,
                     roam: true,
+                    draggable: true,
+                    edgeSymbol: ['none', 'arrow'],
+                    edgeSymbolSize: [4, 10],
                     label: {{
-                        show: false,
-                        position: 'right',
+                        show: true,
+                        position: 'bottom',
+                        color: '#aaa',
+                        fontSize: 10,
                         formatter: '{{b}}'
                     }},
-                    labelLayout: {{
-                        hideOverlap: true
-                    }},
                     force: {{
-                        repulsion: 100,
-                        edgeLength: 50,
+                        repulsion: 300,
+                        edgeLength: 100,
                         gravity: 0.1
                     }},
                     lineStyle: {{

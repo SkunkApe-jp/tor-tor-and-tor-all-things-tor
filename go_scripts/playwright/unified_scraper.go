@@ -37,6 +37,7 @@ var (
 	optScreenshot       bool
 	optLinks            bool
 	optTitles           bool
+	optHTML             bool  // New option: Save HTML content
 	optInterSiteDelay   int   // Inter-site delay in minutes (default: 8-15 Gaussian)
 	optIntraPageDelay   int   // Intra-page "reading" delay in seconds (default: 60-120)
 	optWorkerCount      int   // Number of parallel workers
@@ -44,10 +45,11 @@ var (
 
 
 type ScrapedData struct {
-	pageTitle  string
-	screenshot []byte
-	links      []string
-	titles     map[string]string
+	pageTitle   string
+	htmlContent string  // New field: Full HTML content
+	screenshot  []byte
+	links       []string
+	titles      map[string]string
 }
 
 func init() {
@@ -58,6 +60,7 @@ func init() {
 	flag.BoolVar(&optScreenshot, "screenshot", false, "Capture full-page screenshots")
 	flag.BoolVar(&optLinks, "links", false, "Extract onion links")
 	flag.BoolVar(&optTitles, "titles", false, "Extract links with titles")
+	flag.BoolVar(&optHTML, "html", false, "Download and save full HTML source")
 	flag.IntVar(&optInterSiteDelay, "inter-delay", 0, "Inter-site delay: 0=Gaussian 8-15min, or set custom mean (min)")
 	flag.IntVar(&optIntraPageDelay, "intra-delay", 0, "Intra-page reading delay: 0=60-120sec, or set custom (sec)")
 	flag.IntVar(&optWorkerCount, "workers", 40, "Number of parallel workers (default: 40)")
@@ -73,10 +76,11 @@ func main() {
 	}
 
 	// Default to all options if none specified
-	if !optScreenshot && !optLinks && !optTitles {
+	if !optScreenshot && !optLinks && !optTitles && !optHTML {
 		optScreenshot = true
 		optLinks = true
 		optTitles = true
+		optHTML = true
 	}
 
 	rand.Seed(time.Now().UnixNano())
@@ -94,7 +98,7 @@ func main() {
 	}
 
 	fmt.Println("[CHECK] Starting unified scraper...")
-	fmt.Printf("[CONFIG] Workers: %d | Screenshot: %v | Links: %v | Titles: %v\n", workers, optScreenshot, optLinks, optTitles)
+	fmt.Printf("[CONFIG] Workers: %d | Screenshot: %v | Links: %v | Titles: %v | HTML: %v\n", workers, optScreenshot, optLinks, optTitles, optHTML)
 	if optInterSiteDelay == 0 {
 		fmt.Println("[STEALTH] Inter-site delay: Gaussian 8-15 min (human-like)")
 	} else {
@@ -177,6 +181,15 @@ func worker(id int, browser playwright.Browser, jobs <-chan string, wg *sync.Wai
 				fmt.Printf("[ERROR] Saving screenshot [%s]: %v\n", targetURL, err)
 			} else {
 				fmt.Printf("[OK] Screenshot saved: %s\n", onionAddr)
+			}
+		}
+
+		// Save HTML
+		if optHTML && data.htmlContent != "" {
+			if err := saveHTML(onionAddr, targetURL, data.htmlContent); err != nil {
+				fmt.Printf("[ERROR] Saving HTML [%s]: %v\n", targetURL, err)
+			} else {
+				fmt.Printf("[OK] HTML saved: %s\n", onionAddr)
 			}
 		}
 
@@ -263,6 +276,14 @@ func processURL(browser playwright.Browser, fullURL string) (*ScrapedData, error
 	// Get main page title
 	pageTitle, _ := page.Title()
 	data.pageTitle = pageTitle
+
+	// Capture HTML if enabled
+	if optHTML {
+		html, err := page.Content()
+		if err == nil {
+			data.htmlContent = html
+		}
+	}
 
 	// Capture screenshot if enabled
 	if optScreenshot {
@@ -379,6 +400,17 @@ func saveMainPageTitle(onionAddr, fullURL string, pageTitle string) error {
 	content := fmt.Sprintf("[%s] -> %s\n", pageTitle, fullURL)
 	return os.WriteFile(filePath, []byte(content), 0644)
 }
+
+func saveHTML(onionAddr, fullURL string, htmlContent string) error {
+	htmlDir := filepath.Join(optOutputDir, onionAddr, "htmls")
+	if err := os.MkdirAll(htmlDir, 0755); err != nil {
+		return err
+	}
+
+	filename := generateFilenameForFile(fullURL)
+	filePath := filepath.Join(htmlDir, filename+".html")
+	return os.WriteFile(filePath, []byte(htmlContent), 0644)
+}
 func formatResults(data *ScrapedData) string {
 	var parts []string
 	if len(data.screenshot) > 0 {
@@ -389,6 +421,9 @@ func formatResults(data *ScrapedData) string {
 	}
 	if len(data.titles) > 0 {
 		parts = append(parts, fmt.Sprintf("titles=%d", len(data.titles)))
+	}
+	if data.htmlContent != "" {
+		parts = append(parts, fmt.Sprintf("html=%dKB", len(data.htmlContent)/1024))
 	}
 	if len(parts) == 0 {
 		return "no data"
