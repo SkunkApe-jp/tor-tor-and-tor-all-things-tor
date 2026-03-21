@@ -13,7 +13,6 @@ venv2/
 scraped_data/
 logs/
 *.log
-advanced_sigma_analysis.html
 
 # Go binaries / Built files
 bin/

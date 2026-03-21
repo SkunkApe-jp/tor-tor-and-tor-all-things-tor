@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-ECharts High-Performance Network Visualization
-Uses Canvas rendering for smooth interaction with thousands of nodes.
+ECharts Nodes-Only Visualization
+Displays nodes without edges/links between them.
 """
 
 import os
@@ -60,7 +60,6 @@ def generate_echarts_viz(scraped_data_dir):
     print(f"Found {len(onion_sites)} onion sites for ECharts")
 
     nodes = []
-    links = []
     site_data = {}
 
     for addr in onion_sites:
@@ -99,16 +98,10 @@ def generate_echarts_viz(scraped_data_dir):
         nodes.append(node_entry)
         site_data[addr] = list(connected_onions)
 
-    for source, targets in site_data.items():
-        for target in targets:
-            pure_target = target.replace('.onion', '')
-            if pure_target in site_data and source != pure_target:
-                links.append({"source": source, "target": pure_target})
-
     html_content = f"""<!DOCTYPE html>
 <html>
 <head>
-    <title>ECharts Onion Network</title>
+    <title>ECharts Onion Network - Nodes Only</title>
     <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
     <style>
         body, #main {{ width: 100vw; height: 100vh; margin: 0; background: #100c2a; overflow: hidden; }}
@@ -119,14 +112,13 @@ def generate_echarts_viz(scraped_data_dir):
 </head>
 <body>
     <div id="ui">
-        <h2 style="margin:0; font-family:sans-serif; color:#7ce7ffd6;">ECharts Canvas Engine</h2>
-        <p style="opacity:0.6; font-size:12px;">{len(nodes)} nodes, {len(links)} links</p>
+        <h2 style="margin:0; font-family:sans-serif; color:#7ce7ffd6;">ECharts - Nodes Only</h2>
+        <p style="opacity:0.6; font-size:12px;">{len(nodes)} nodes</p>
     </div>
     <div id="main"></div>
     <script>
         const chart = echarts.init(document.getElementById('main'), 'dark');
         const nodes = {json.dumps(nodes)};
-        const links = {json.dumps(links)};
 
         const option = {{
             backgroundColor: '#100c2a',
@@ -154,11 +146,8 @@ def generate_echarts_viz(scraped_data_dir):
                     type: 'graph',
                     layout: 'force',
                     data: nodes,
-                    links: links,
                     roam: true,
                     draggable: true,
-                    edgeSymbol: ['none', 'arrow'],
-                    edgeSymbolSize: [4, 10],
                     label: {{
                         show: true,
                         position: 'bottom',
@@ -168,19 +157,10 @@ def generate_echarts_viz(scraped_data_dir):
                     }},
                     force: {{
                         repulsion: 300,
-                        edgeLength: 100,
                         gravity: 0.1
                     }},
-                    lineStyle: {{
-                        color: 'source',
-                        curveness: 0.1,
-                        opacity: 0.4
-                    }},
                     emphasis: {{
-                        focus: 'adjacency',
-                        lineStyle: {{
-                            width: 3
-                        }}
+                        focus: 'adjacency'
                     }}
                 }}
             ]
@@ -192,10 +172,10 @@ def generate_echarts_viz(scraped_data_dir):
 </body>
 </html>"""
 
-    out = os.path.join(scraped_data_dir, "echarts_visualization.html")
+    out = os.path.join(scraped_data_dir, "echarts_nodes_only.html")
     with open(out, "w", encoding="utf-8") as f:
         f.write(html_content)
-    print(f"ECharts visualization saved to {out}")
+    print(f"ECharts nodes-only visualization saved to {out}")
 
 if __name__ == "__main__":
     import sys
