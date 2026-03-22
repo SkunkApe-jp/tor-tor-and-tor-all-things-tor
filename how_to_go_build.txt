@@ -26,3 +26,7 @@
 
     Binaries already exist in those directories (e.g., main, index, playwright_scraper), so they may
     already be built.
+
+
+    How to build for Windows:
+     go build -o "bin\unified_scraper.exe" "go_scripts\playwright\unified_scraper.go"
