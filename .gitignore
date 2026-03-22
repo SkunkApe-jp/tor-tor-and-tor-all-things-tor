@@ -20,3 +20,8 @@ bin/
 
 # Large ML models
 *.gguf
+
+# NPM packages / Offline libs (downloaded for offline visualizations)
+node_modules/
+*.min.js
+!misc_python_scripts/viz/*.min.js

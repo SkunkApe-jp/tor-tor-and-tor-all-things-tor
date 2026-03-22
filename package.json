@@ -1,0 +1,10 @@
+{
+  "dependencies": {
+    "@cosmograph/cosmograph": "^2.2.1",
+    "cytoscape": "^3.33.1",
+    "d3": "^7.9.0",
+    "force-graph": "^1.51.2",
+    "graphology": "^0.26.0",
+    "sigma": "^3.0.2"
+  }
+}

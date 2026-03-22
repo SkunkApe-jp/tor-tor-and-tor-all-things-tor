@@ -63,7 +63,7 @@ func init() {
 	flag.BoolVar(&optHTML, "html", false, "Download and save full HTML source")
 	flag.IntVar(&optInterSiteDelay, "inter-delay", 0, "Inter-site delay: 0=Gaussian 8-15min, or set custom mean (min)")
 	flag.IntVar(&optIntraPageDelay, "intra-delay", 0, "Intra-page reading delay: 0=60-120sec, or set custom (sec)")
-	flag.IntVar(&optWorkerCount, "workers", 40, "Number of parallel workers (default: 40)")
+	flag.IntVar(&optWorkerCount, "workers", 1, "Number of parallel workers (default: 1)")
 }
 
 func main() {
