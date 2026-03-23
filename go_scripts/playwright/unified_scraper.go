@@ -40,6 +40,7 @@ var (
 	optTitles         bool
 	optHTML           bool // Save raw HTML
 	optSaveSite       bool // Save as Webpage Complete (HTML + assets rewritten)
+	optNoJS           bool // Strip all JS for maximum safety and no redirects
 	optInterSiteDelay int  // Inter-site delay in minutes (default: 8-15 Gaussian)
 	optIntraPageDelay int  // Intra-page "reading" delay in seconds (default: 60-120)
 	optWorkerCount    int  // Number of parallel workers
@@ -55,7 +56,7 @@ type ScrapedData struct {
 	// Save-as-complete fields
 	siteHTML          string            // Rewritten HTML for offline use
 	siteResources     map[string][]byte // original URL -> raw bytes
-	siteFilenames     map[string]string // original URL -> local _files/filename
+	siteFilenames     map[string]string // original URL -> local mirrored path
 }
 
 func init() {
@@ -68,6 +69,7 @@ func init() {
 	flag.BoolVar(&optTitles, "titles", false, "Extract links with titles")
 	flag.BoolVar(&optHTML, "html", false, "Download and save full HTML source")
 	flag.BoolVar(&optSaveSite, "save-site", false, "Save page as Webpage Complete (HTML + all assets locally rewritten)")
+	flag.BoolVar(&optNoJS, "no-js", false, "Strip all JavaScript from local mirror for maximum security")
 	flag.IntVar(&optInterSiteDelay, "inter-delay", 0, "Inter-site delay: 0=Gaussian 8-15min, or set custom mean (min)")
 	flag.IntVar(&optIntraPageDelay, "intra-delay", 0, "Intra-page reading delay: 0=60-120sec, or set custom (sec)")
 	flag.IntVar(&optWorkerCount, "workers", 1, "Number of parallel workers (default: 1)")
@@ -108,7 +110,7 @@ func main() {
 	// Set defaults if not specified
 	workers := optWorkerCount
 	if workers <= 0 {
-		workers = 40 // Default
+		workers = 10 // Default (Reduced for better stability and lower resource usage)
 	}
 
 	fmt.Println("[CHECK] Starting unified scraper v1.2...")
@@ -335,7 +337,7 @@ func processURL(browser playwright.Browser, fullURL string) (*ScrapedData, error
 	pageTitle, _ := page.Title()
 	data.pageTitle = pageTitle
 
-	// Capture raw HTML if enabled
+	// Capture raw HTML and aggressively Fetch missing assets (XML, Favicons, etc.)
 	if optHTML || optSaveSite {
 		html, err := page.Content()
 		if err == nil {
@@ -343,6 +345,61 @@ func processURL(browser playwright.Browser, fullURL string) (*ScrapedData, error
 				data.htmlContent = html
 			}
 			if optSaveSite {
+				// --- PROACTIVE ASSET DISCOVERY ---
+				// Find anything the browser missed (favicons, opensearch xmls, etc.)
+				extensions := "png|jpg|jpeg|gif|ico|svg|css|xml|json|woff2?|ttf|otf|bin|pdf"
+				if !optNoJS {
+					extensions += "|js"
+				}
+				assetRegex := regexp.MustCompile(`(?i)(?:src|href|url)=['"]([^'"]+\.(?:` + extensions + `))(?:\?[^'"]*)?['"]`)
+				potentialAssets := assetRegex.FindAllStringSubmatch(html, -1)
+				
+				baseURLParsed, _ := url.Parse(fullURL)
+				for _, match := range potentialAssets {
+					if len(match) < 2 { continue }
+					assetPath := match[1]
+					
+					// Resolve to absolute URL
+					assetURLObj, err := baseURLParsed.Parse(assetPath)
+					if err != nil { continue }
+					assetURL := assetURLObj.String()
+					
+					// Skip data URIs or already captured ones
+					if strings.HasPrefix(assetURL, "data:") { continue }
+
+					resMu.Lock()
+					_, alreadyCaptured := capturedResources[assetURL]
+					resMu.Unlock()
+					
+					if !alreadyCaptured && (assetURLObj.Host == baseURLParsed.Host || assetURLObj.Host == "") {
+						// Small artificial delay to avoid hammering the SOCKS proxy too fast
+						time.Sleep(100 * time.Millisecond)
+						
+						// Use browser evaluation to fetch the resource (keeps cookies/headers/proxy)
+						fetchScript := fmt.Sprintf(`fetch("%s").then(r => r.arrayBuffer()).then(b => Array.from(new Uint8Array(b))).catch(e => null)`, assetURL)
+						if rawArr, err := page.Evaluate(fetchScript); err == nil && rawArr != nil {
+							if resSlice, ok := rawArr.([]interface{}); ok {
+								body := make([]byte, len(resSlice))
+								for i, v := range resSlice {
+									// Handle both float64 and int types returned by the browser
+									switch val := v.(type) {
+									case float64:
+										body[i] = byte(val)
+									case int:
+										body[i] = byte(val)
+									case int64:
+										body[i] = byte(val)
+									}
+								}
+								resMu.Lock()
+								capturedResources[assetURL] = body
+								resMu.Unlock()
+							}
+						}
+					}
+				}
+				// --- END PROACTIVE ASSET DISCOVERY ---
+
 				// Build filename map and rewrite HTML
 				data.siteResources = capturedResources
 				data.siteFilenames = make(map[string]string)
@@ -413,12 +470,13 @@ func resourceRelativePath(resURL string) string {
 		return "resource_bin.bin"
 	}
 
-	cleanPath := strings.Trim(u.Path, "/")
+	// Preserve full directory structure (e.g. static/images/...)
+	cleanPath := strings.TrimLeft(u.Path, "/")
 	if cleanPath == "" {
 		return "root_resource.bin"
 	}
 
-	// Sanitise individual components
+	// Sanitise individual components while keeping hierarchical structure
 	parts := strings.Split(cleanPath, "/")
 	for i, p := range parts {
 		parts[i] = strings.Map(func(r rune) rune {
@@ -428,14 +486,15 @@ func resourceRelativePath(resURL string) string {
 			}
 			return '_'
 		}, p)
-		if len(parts[i]) > 100 {
-			parts[i] = parts[i][:100]
+		// Limit length to avoid Windows MAX_PATH issues while remaining professional
+		if len(parts[i]) > 120 {
+			parts[i] = parts[i][:120]
 		}
 	}
 	
 	finalName := strings.Join(parts, "/")
 	
-	// If it has no extension, give it a default
+	// If it has no extension, give it a default to avoid ambiguous filenames
 	if !strings.Contains(path.Base(finalName), ".") {
 		finalName += ".bin"
 	}
@@ -443,15 +502,18 @@ func resourceRelativePath(resURL string) string {
 	return finalName
 }
 
-// rewriteHTML replaces all resource URLs (absolute or relative) in the HTML with local paths.
+// rewriteHTML replaces all resource URLs with mirrored local paths.
+// Optimized with a single-pass Replacer to minimize CPU and RAM usage.
 func rewriteHTML(html string, baseURL string, filenameMap map[string]string) string {
 	base, err := url.Parse(baseURL)
 	if err != nil {
 		return html
 	}
 
+	var replaces []string
+
 	for origURL, localName := range filenameMap {
-		localRef := "_files/" + localName
+		localRef := localName // NO "_files/" - preservation of directory structure
 		if localName == "index.html" {
 			localRef = "index.html"
 		}
@@ -472,7 +534,6 @@ func rewriteHTML(html string, baseURL string, filenameMap map[string]string) str
 			}
 			
 			// 2. Relative paths (same-folder)
-			// If target is in the same folder as base, add simpler relative matches
 			baseDir := path.Dir(base.Path)
 			if baseDir == "." {
 				baseDir = "/"
@@ -489,40 +550,61 @@ func rewriteHTML(html string, baseURL string, filenameMap map[string]string) str
 			}
 		}
 
-		// Replace quoted occurrences
+		// Use single-pass replacer approach for performance
 		for _, q := range []string{`"`, `'`} {
 			for _, m := range matches {
-				if m == "" || m == "/" {
-					continue
-				}
-				html = strings.ReplaceAll(html, q+m+q, q+localRef+q)
+				if m == "" || m == "/" { continue }
+				replaces = append(replaces, q+m+q, q+localRef+q)
 			}
 		}
-		// Also handle url() in CSS
 		for _, m := range matches {
-			if m == "" || m == "/" {
-				continue
-			}
-			html = strings.ReplaceAll(html, "url("+m+")", "url("+localRef+")")
-			html = strings.ReplaceAll(html, "url('"+m+"')", "url('"+localRef+"')")
-			html = strings.ReplaceAll(html, "url(\""+m+"\")", "url(\""+localRef+"\")")
+			if m == "" || m == "/" { continue }
+			replaces = append(replaces, "url("+m+")", "url("+localRef+")")
+			replaces = append(replaces, "url('"+m+"')", "url('"+localRef+"')")
+			replaces = append(replaces, "url(\""+m+"\")", "url(\""+localRef+"\")")
 		}
 	}
 
-	// Finally, remove or neutralize <base> tags as they interfere with local relative paths
+	// Execute all replacements in a single O(N) pass
+	replacer := strings.NewReplacer(replaces...)
+	html = replacer.Replace(html)
+
+	// Neutralize <base> tags to fix local relative resolution
 	reBase := regexp.MustCompile(`(?i)<base\s+[^>]*>`)
 	html = reBase.ReplaceAllString(html, "<!-- base removed -->")
+
+	// --- NO-JS MODE ---
+	// If NoJS is active, completely strip all <script> tags for total safety
+	if optNoJS {
+		reScripts := regexp.MustCompile(`(?i)<script\b[^>]*>[\s\S]*?</script>|<script\b[^>]*>`)
+		html = reScripts.ReplaceAllString(html, "<!-- script stripped -->")
+		
+		// Also strip inline "on..." event handlers (onclick, onload, etc.)
+		reEvents := regexp.MustCompile(`(?i)\s+on[a-z]+\s*=\s*['"][^'"]+['"]`)
+		html = reEvents.ReplaceAllString(html, " /* JS event stripped */")
+	}
+
+	// --- ANTI-MIRROR NEUTRALIZER ---
+	// 1. Remove Ahmia's blackout CSS that triggers on non-onion domains
+	reBlackout := regexp.MustCompile(`(?i)<link[^>]+href="data:text/css;base64,[^"]+"[^>]*>`)
+	html = reBlackout.ReplaceAllString(html, "<!-- anti-clone css removed -->")
+
+	// 2. Neutralize JavaScript redirects (window.location = ...)
+	// This makes the local file stay local instead of jumping to the clearnet
+	reRedirect := regexp.MustCompile(`(?i)window\.location(?:\.href)?\s*=\s*['"][^'"]+['"]`)
+	html = reRedirect.ReplaceAllString(html, "/* redirect blocked */")
+	// --- END NEUTRALIZER ---
 
 	return html
 }
 
-// saveSiteComplete writes index.html + _files/ folder.
+// saveSiteComplete writes index.html and recreates the site's mirrored directory structure.
 func saveSiteComplete(onionAddr, fullURL string, data *ScrapedData) error {
 	pageName := generateFilenameForFile(fullURL)
 	siteDir := filepath.Join(optOutputDir, onionAddr, "saved_site", pageName)
-	filesDir := filepath.Join(siteDir, "_files")
 
-	if err := os.MkdirAll(filesDir, 0755); err != nil {
+	// Create the base site directory
+	if err := os.MkdirAll(siteDir, 0755); err != nil {
 		return err
 	}
 
@@ -532,22 +614,30 @@ func saveSiteComplete(onionAddr, fullURL string, data *ScrapedData) error {
 		return err
 	}
 
-	// Write every captured asset
+	// Write every captured asset into its original mirrored path
 	for origURL, body := range data.siteResources {
-		localName, ok := data.siteFilenames[origURL]
-		if !ok {
+		localRelativePath, ok := data.siteFilenames[origURL]
+		if !ok || localRelativePath == "index.html" {
 			continue
 		}
-		if assetPath := filepath.Join(filesDir, localName); true {
-			assetDir := filepath.Dir(assetPath)
-			os.MkdirAll(assetDir, 0755)
-			if err := os.WriteFile(assetPath, body, 0644); err != nil {
-				fmt.Printf("[WARN] Could not save asset %s: %v\n", localName, err)
-			}
+		
+		// Skip .js assets in No-JS mode
+		if optNoJS && strings.HasSuffix(localRelativePath, ".js") {
+			continue
+		}
+
+		// --- DEEP DEFANGING ---
+		// Join with siteDir to build the full local path (e.g. siteDir/static/images/...)
+		assetPath := filepath.Join(siteDir, localRelativePath)
+		assetDir := filepath.Dir(assetPath)
+		os.MkdirAll(assetDir, 0755)
+		
+		if err := os.WriteFile(assetPath, body, 0644); err != nil {
+			fmt.Printf("[WARN] Could not save asset %s: %v\n", localRelativePath, err)
 		}
 	}
 
-	fmt.Printf("[SITE] Saved to %s (%d assets)\n", siteDir, len(data.siteResources))
+	fmt.Printf("[SITE] Professional mirror saved to %s (%d assets)\n", siteDir, len(data.siteResources))
 	return nil
 }
 
