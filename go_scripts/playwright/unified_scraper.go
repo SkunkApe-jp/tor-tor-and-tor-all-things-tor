@@ -40,7 +40,7 @@ var (
 	optTitles         bool
 	optHTML           bool // Save raw HTML
 	optSaveSite       bool // Save as Webpage Complete (HTML + assets rewritten)
-	optNoJS           bool // Strip all JS for maximum safety and no redirects
+	optAllowJS        bool // ALLOW dangerous JS (Default: False)
 	optInterSiteDelay int  // Inter-site delay in minutes (default: 8-15 Gaussian)
 	optIntraPageDelay int  // Intra-page "reading" delay in seconds (default: 60-120)
 	optWorkerCount    int  // Number of parallel workers
@@ -69,7 +69,7 @@ func init() {
 	flag.BoolVar(&optTitles, "titles", false, "Extract links with titles")
 	flag.BoolVar(&optHTML, "html", false, "Download and save full HTML source")
 	flag.BoolVar(&optSaveSite, "save-site", false, "Save page as Webpage Complete (HTML + all assets locally rewritten)")
-	flag.BoolVar(&optNoJS, "no-js", false, "Strip all JavaScript from local mirror for maximum security")
+	flag.BoolVar(&optAllowJS, "allow-js", false, "ALLOW dangerous JavaScript to be saved (Risk: Redirects/Tracking)")
 	flag.IntVar(&optInterSiteDelay, "inter-delay", 0, "Inter-site delay: 0=Gaussian 8-15min, or set custom mean (min)")
 	flag.IntVar(&optIntraPageDelay, "intra-delay", 0, "Intra-page reading delay: 0=60-120sec, or set custom (sec)")
 	flag.IntVar(&optWorkerCount, "workers", 1, "Number of parallel workers (default: 1)")
@@ -288,6 +288,13 @@ func processURL(browser playwright.Browser, fullURL string) (*ScrapedData, error
 	if optSaveSite {
 		page.On("response", func(response playwright.Response) {
 			resURL := response.URL()
+
+			// --- SECURITY BLOCK ---
+			// Reject JS files immediately if not explicitly allowed
+			if !optAllowJS && (strings.Contains(strings.ToLower(resURL), ".js") || strings.Contains(strings.ToLower(resURL), ".mjs")) {
+				return
+			}
+
 			// Skip the main HTML document itself and data: URIs
 			if resURL == fullURL || strings.HasPrefix(resURL, "data:") {
 				return
@@ -348,7 +355,7 @@ func processURL(browser playwright.Browser, fullURL string) (*ScrapedData, error
 				// --- PROACTIVE ASSET DISCOVERY ---
 				// Find anything the browser missed (favicons, opensearch xmls, etc.)
 				extensions := "png|jpg|jpeg|gif|ico|svg|css|xml|json|woff2?|ttf|otf|bin|pdf"
-				if !optNoJS {
+				if optAllowJS {
 					extensions += "|js"
 				}
 				assetRegex := regexp.MustCompile(`(?i)(?:src|href|url)=['"]([^'"]+\.(?:` + extensions + `))(?:\?[^'"]*)?['"]`)
@@ -573,15 +580,15 @@ func rewriteHTML(html string, baseURL string, filenameMap map[string]string) str
 	reBase := regexp.MustCompile(`(?i)<base\s+[^>]*>`)
 	html = reBase.ReplaceAllString(html, "<!-- base removed -->")
 
-	// --- NO-JS MODE ---
-	// If NoJS is active, completely strip all <script> tags for total safety
-	if optNoJS {
+	// --- NO-JS MODE (DEFAULT) ---
+	// Completly strip all <script> tags and active handlers for total safety
+	if !optAllowJS {
 		reScripts := regexp.MustCompile(`(?i)<script\b[^>]*>[\s\S]*?</script>|<script\b[^>]*>`)
-		html = reScripts.ReplaceAllString(html, "<!-- script stripped -->")
+		html = reScripts.ReplaceAllString(html, "<!-- script stripped for safety -->")
 		
 		// Also strip inline "on..." event handlers (onclick, onload, etc.)
 		reEvents := regexp.MustCompile(`(?i)\s+on[a-z]+\s*=\s*['"][^'"]+['"]`)
-		html = reEvents.ReplaceAllString(html, " /* JS event stripped */")
+		html = reEvents.ReplaceAllString(html, " /* security purge: JS handler removed */")
 	}
 
 	// --- ANTI-MIRROR NEUTRALIZER ---
@@ -621,8 +628,8 @@ func saveSiteComplete(onionAddr, fullURL string, data *ScrapedData) error {
 			continue
 		}
 		
-		// Skip .js assets in No-JS mode
-		if optNoJS && strings.HasSuffix(localRelativePath, ".js") {
+		// Skip .js assets if not explicitly allowed
+		if !optAllowJS && strings.Contains(strings.ToLower(localRelativePath), ".js") {
 			continue
 		}
 
