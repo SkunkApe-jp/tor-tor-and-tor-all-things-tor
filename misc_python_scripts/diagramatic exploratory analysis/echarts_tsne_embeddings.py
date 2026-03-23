@@ -144,8 +144,9 @@ def generate_echarts_viz(tsne_coords, site_data, output_file):
         #searchBox::placeholder { color: #8b949e; }
         #clearSearch { padding: 8px 12px; border-radius: 6px; border: 1px solid #30363d; background: rgba(22, 27, 34, 0.9); color: #fff; cursor: pointer; font-size: 14px; }
         #clearSearch:hover { background: rgba(48, 54, 61, 0.9); }
-        .tooltip-card { padding: 10px; min-width: 250px; }
+        .tooltip-card { padding: 10px; min-width: 250px; max-width: 400px; }
         .tooltip-text { font-size: 11px; opacity: 0.8; margin-top: 5px; max-height: 60px; overflow: hidden; }
+        .tooltip-img { max-width: 100%; max-height: 150px; width: auto; height: auto; border-radius: 4px; margin-top: 8px; display: block; }
     </style>
 </head>
 <body>
@@ -229,6 +230,7 @@ def generate_echarts_viz(tsne_coords, site_data, output_file):
                             value: n.value,
                             id: n.id,
                             text_preview: n.text_preview,
+                            image: n.image,
                             symbolSize: n.symbolSize,
                             itemStyle: n.itemStyle
                         }))
@@ -248,6 +250,7 @@ def generate_echarts_viz(tsne_coords, site_data, output_file):
                         value: n.value,
                         id: n.id,
                         text_preview: n.text_preview,
+                        image: n.image,
                         symbolSize: 25,
                         itemStyle: { color: '#d5ff16', borderColor: '#fff', borderWidth: 2 }
                     };
@@ -257,6 +260,7 @@ def generate_echarts_viz(tsne_coords, site_data, output_file):
                         value: n.value,
                         id: n.id,
                         text_preview: n.text_preview,
+                        image: n.image,
                         symbolSize: 8,
                         itemStyle: { opacity: 0.3 }
                     };

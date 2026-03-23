@@ -107,7 +107,7 @@ def generate_echarts_viz(scraped_data_dir):
         body, #main {{ width: 100vw; height: 100vh; margin: 0; background: #100c2a; overflow: hidden; }}
         #ui {{ position: absolute; top: 20px; left: 20px; z-index: 10; color: #fff; pointer-events: none; }}
         .tooltip-card {{ padding: 10px; min-width: 200px; }}
-        .tooltip-img {{ width: 100%; border-radius: 4px; margin-top: 5px; border: 1px solid #444; }}
+        .tooltip-img {{ max-width: 100%; max-height: 150px; width: auto; height: auto; border-radius: 4px; margin-top: 5px; border: 1px solid #444; display: block; }}
     </style>
 </head>
 <body>

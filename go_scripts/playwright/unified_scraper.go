@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -34,33 +35,39 @@ var (
 
 // Scraping options
 var (
-	optScreenshot       bool
-	optLinks            bool
-	optTitles           bool
-	optHTML             bool  // New option: Save HTML content
-	optInterSiteDelay   int   // Inter-site delay in minutes (default: 8-15 Gaussian)
-	optIntraPageDelay   int   // Intra-page "reading" delay in seconds (default: 60-120)
-	optWorkerCount      int   // Number of parallel workers
+	optScreenshot     bool
+	optLinks          bool
+	optTitles         bool
+	optHTML           bool // Save raw HTML
+	optSaveSite       bool // Save as Webpage Complete (HTML + assets rewritten)
+	optInterSiteDelay int  // Inter-site delay in minutes (default: 8-15 Gaussian)
+	optIntraPageDelay int  // Intra-page "reading" delay in seconds (default: 60-120)
+	optWorkerCount    int  // Number of parallel workers
 )
 
 
 type ScrapedData struct {
-	pageTitle   string
-	htmlContent string  // New field: Full HTML content
-	screenshot  []byte
-	links       []string
-	titles      map[string]string
+	pageTitle         string
+	htmlContent       string // Raw HTML
+	screenshot        []byte
+	links             []string
+	titles            map[string]string
+	// Save-as-complete fields
+	siteHTML          string            // Rewritten HTML for offline use
+	siteResources     map[string][]byte // original URL -> raw bytes
+	siteFilenames     map[string]string // original URL -> local _files/filename
 }
 
 func init() {
-	flag.StringVar(&optTargetsFile, "targets", "../../targets.yaml", "Path to targets file")
-	flag.StringVar(&optOutputDir, "output", "../../scraped_data", "Directory to save results")
-	flag.StringVar(&optLogFile, "log", "../../logs/unified_scraper.log", "Path to unified log file")
+	flag.StringVar(&optTargetsFile, "targets", "../targets.yaml", "Path to targets file")
+	flag.StringVar(&optOutputDir, "output", "../scraped_data", "Directory to save results")
+	flag.StringVar(&optLogFile, "log", "../logs/unified_scraper.log", "Path to unified log file")
 
 	flag.BoolVar(&optScreenshot, "screenshot", false, "Capture full-page screenshots")
 	flag.BoolVar(&optLinks, "links", false, "Extract onion links")
 	flag.BoolVar(&optTitles, "titles", false, "Extract links with titles")
 	flag.BoolVar(&optHTML, "html", false, "Download and save full HTML source")
+	flag.BoolVar(&optSaveSite, "save-site", false, "Save page as Webpage Complete (HTML + all assets locally rewritten)")
 	flag.IntVar(&optInterSiteDelay, "inter-delay", 0, "Inter-site delay: 0=Gaussian 8-15min, or set custom mean (min)")
 	flag.IntVar(&optIntraPageDelay, "intra-delay", 0, "Intra-page reading delay: 0=60-120sec, or set custom (sec)")
 	flag.IntVar(&optWorkerCount, "workers", 1, "Number of parallel workers (default: 1)")
@@ -76,11 +83,18 @@ func main() {
 	}
 
 	// Default to all options if none specified
-	if !optScreenshot && !optLinks && !optTitles && !optHTML {
+	if !optScreenshot && !optLinks && !optTitles && !optHTML && !optSaveSite {
 		optScreenshot = true
 		optLinks = true
 		optTitles = true
-		optHTML = true
+		optSaveSite = true
+		// Standalone HTML is redundant when save-site is active
+	}
+
+	// If both are true, disable standalone HTML saving to avoid redundancy
+	if optSaveSite && optHTML {
+		fmt.Println("[CONFIG] Redundant: Standalone HTML disabled because SaveSite is active.")
+		optHTML = false
 	}
 
 	rand.Seed(time.Now().UnixNano())
@@ -97,8 +111,8 @@ func main() {
 		workers = 40 // Default
 	}
 
-	fmt.Println("[CHECK] Starting unified scraper...")
-	fmt.Printf("[CONFIG] Workers: %d | Screenshot: %v | Links: %v | Titles: %v | HTML: %v\n", workers, optScreenshot, optLinks, optTitles, optHTML)
+	fmt.Println("[CHECK] Starting unified scraper v1.2...")
+	fmt.Printf("[CONFIG] Workers: %d | Screenshot: %v | Links: %v | Titles: %v | HTML: %v | SaveSite: %v\n", workers, optScreenshot, optLinks, optTitles, optHTML, optSaveSite)
 	if optInterSiteDelay == 0 {
 		fmt.Println("[STEALTH] Inter-site delay: Gaussian 8-15 min (human-like)")
 	} else {
@@ -184,8 +198,8 @@ func worker(id int, browser playwright.Browser, jobs <-chan string, wg *sync.Wai
 			}
 		}
 
-		// Save HTML
-		if optHTML && data.htmlContent != "" {
+		// Save HTML (only if site-saving is disabled to avoid duplicates)
+		if optHTML && !optSaveSite && data.htmlContent != "" {
 			if err := saveHTML(onionAddr, targetURL, data.htmlContent); err != nil {
 				fmt.Printf("[ERROR] Saving HTML [%s]: %v\n", targetURL, err)
 			} else {
@@ -220,6 +234,15 @@ func worker(id int, browser playwright.Browser, jobs <-chan string, wg *sync.Wai
 			}
 		}
 
+		// Save as Webpage Complete
+		if optSaveSite && data.siteHTML != "" {
+			if err := saveSiteComplete(onionAddr, targetURL, data); err != nil {
+				fmt.Printf("[ERROR] Saving site [%s]: %v\n", targetURL, err)
+			} else {
+				fmt.Printf("[OK] Site saved complete: %s (%d assets)\n", onionAddr, len(data.siteResources))
+			}
+		}
+
 		logMsg := formatResults(data)
 		appendLog(targetURL, "SUCCESS", logMsg, data)
 	}
@@ -227,8 +250,8 @@ func worker(id int, browser playwright.Browser, jobs <-chan string, wg *sync.Wai
 
 func processURL(browser playwright.Browser, fullURL string) (*ScrapedData, error) {
 	context, err := browser.NewContext(playwright.BrowserNewContextOptions{
-		UserAgent: playwright.String(TorUA),
-		Viewport:  &playwright.Size{Width: 1400, Height: 900},
+		UserAgent:         playwright.String(TorUA),
+		Viewport:          &playwright.Size{Width: 1400, Height: 900},
 		IgnoreHttpsErrors: playwright.Bool(true),
 		ExtraHttpHeaders: map[string]string{
 			"Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -253,6 +276,38 @@ func processURL(browser playwright.Browser, fullURL string) (*ScrapedData, error
 	}
 	page.SetDefaultTimeout(1800000)
 
+	// -------------------------------------------------------------------
+	// Resource interception for "Save as Webpage Complete" mode
+	// -------------------------------------------------------------------
+	var resMu sync.Mutex
+	var resWg sync.WaitGroup
+	capturedResources := make(map[string][]byte) // originalURL -> raw bytes
+
+	if optSaveSite {
+		page.On("response", func(response playwright.Response) {
+			resURL := response.URL()
+			// Skip the main HTML document itself and data: URIs
+			if resURL == fullURL || strings.HasPrefix(resURL, "data:") {
+				return
+			}
+			status := response.Status()
+			if status < 200 || status >= 400 {
+				return
+			}
+			resWg.Add(1)
+			go func() {
+				defer resWg.Done()
+				body, err := response.Body()
+				if err != nil || len(body) == 0 {
+					return
+				}
+				resMu.Lock()
+				capturedResources[resURL] = body
+				resMu.Unlock()
+			}()
+		})
+	}
+
 	fmt.Printf("[LOAD] %s\n", fullURL)
 	if _, err := page.Goto(fullURL); err != nil {
 		return nil, err
@@ -268,6 +323,9 @@ func processURL(browser playwright.Browser, fullURL string) (*ScrapedData, error
 	fmt.Printf("[READ] Simulating human reading: %v\n", readingDelay)
 	time.Sleep(readingDelay)
 
+	// Wait for all resource-fetching goroutines to finish before processing capturedResources
+	resWg.Wait()
+
 	data := &ScrapedData{
 		links:  []string{},
 		titles: make(map[string]string),
@@ -277,11 +335,26 @@ func processURL(browser playwright.Browser, fullURL string) (*ScrapedData, error
 	pageTitle, _ := page.Title()
 	data.pageTitle = pageTitle
 
-	// Capture HTML if enabled
-	if optHTML {
+	// Capture raw HTML if enabled
+	if optHTML || optSaveSite {
 		html, err := page.Content()
 		if err == nil {
-			data.htmlContent = html
+			if optHTML {
+				data.htmlContent = html
+			}
+			if optSaveSite {
+				// Build filename map and rewrite HTML
+				data.siteResources = capturedResources
+				data.siteFilenames = make(map[string]string)
+				for resURL := range capturedResources {
+					local := resourceRelativePath(resURL)
+					data.siteFilenames[resURL] = local
+				}
+				// Add the page itself to the map so links to it stay local
+				data.siteFilenames[fullURL] = "index.html"
+				
+				data.siteHTML = rewriteHTML(html, fullURL, data.siteFilenames)
+			}
 		}
 	}
 
@@ -331,6 +404,151 @@ func processURL(browser playwright.Browser, fullURL string) (*ScrapedData, error
 	}
 
 	return data, nil
+}
+
+// resourceRelativePath generates a local path that preserves the original URL's directory structure.
+func resourceRelativePath(resURL string) string {
+	u, err := url.Parse(resURL)
+	if err != nil {
+		return "resource_bin.bin"
+	}
+
+	cleanPath := strings.Trim(u.Path, "/")
+	if cleanPath == "" {
+		return "root_resource.bin"
+	}
+
+	// Sanitise individual components
+	parts := strings.Split(cleanPath, "/")
+	for i, p := range parts {
+		parts[i] = strings.Map(func(r rune) rune {
+			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
+				(r >= '0' && r <= '9') || r == '.' || r == '-' || r == '_' {
+				return r
+			}
+			return '_'
+		}, p)
+		if len(parts[i]) > 100 {
+			parts[i] = parts[i][:100]
+		}
+	}
+	
+	finalName := strings.Join(parts, "/")
+	
+	// If it has no extension, give it a default
+	if !strings.Contains(path.Base(finalName), ".") {
+		finalName += ".bin"
+	}
+
+	return finalName
+}
+
+// rewriteHTML replaces all resource URLs (absolute or relative) in the HTML with local paths.
+func rewriteHTML(html string, baseURL string, filenameMap map[string]string) string {
+	base, err := url.Parse(baseURL)
+	if err != nil {
+		return html
+	}
+
+	for origURL, localName := range filenameMap {
+		localRef := "_files/" + localName
+		if localName == "index.html" {
+			localRef = "index.html"
+		}
+
+		targetURL, err := url.Parse(origURL)
+		if err != nil {
+			continue
+		}
+
+		var matches []string
+		matches = append(matches, origURL)
+
+		// 1. Root-relative paths
+		if targetURL.Host == base.Host {
+			matches = append(matches, targetURL.Path)
+			if targetURL.RawQuery != "" {
+				matches = append(matches, targetURL.Path+"?"+targetURL.RawQuery)
+			}
+			
+			// 2. Relative paths (same-folder)
+			// If target is in the same folder as base, add simpler relative matches
+			baseDir := path.Dir(base.Path)
+			if baseDir == "." {
+				baseDir = "/"
+			}
+			if strings.HasPrefix(targetURL.Path, baseDir) {
+				rel := strings.TrimPrefix(targetURL.Path, baseDir)
+				rel = strings.TrimPrefix(rel, "/")
+				if rel != "" {
+					matches = append(matches, rel)
+					if targetURL.RawQuery != "" {
+						matches = append(matches, rel+"?"+targetURL.RawQuery)
+					}
+				}
+			}
+		}
+
+		// Replace quoted occurrences
+		for _, q := range []string{`"`, `'`} {
+			for _, m := range matches {
+				if m == "" || m == "/" {
+					continue
+				}
+				html = strings.ReplaceAll(html, q+m+q, q+localRef+q)
+			}
+		}
+		// Also handle url() in CSS
+		for _, m := range matches {
+			if m == "" || m == "/" {
+				continue
+			}
+			html = strings.ReplaceAll(html, "url("+m+")", "url("+localRef+")")
+			html = strings.ReplaceAll(html, "url('"+m+"')", "url('"+localRef+"')")
+			html = strings.ReplaceAll(html, "url(\""+m+"\")", "url(\""+localRef+"\")")
+		}
+	}
+
+	// Finally, remove or neutralize <base> tags as they interfere with local relative paths
+	reBase := regexp.MustCompile(`(?i)<base\s+[^>]*>`)
+	html = reBase.ReplaceAllString(html, "<!-- base removed -->")
+
+	return html
+}
+
+// saveSiteComplete writes index.html + _files/ folder.
+func saveSiteComplete(onionAddr, fullURL string, data *ScrapedData) error {
+	pageName := generateFilenameForFile(fullURL)
+	siteDir := filepath.Join(optOutputDir, onionAddr, "saved_site", pageName)
+	filesDir := filepath.Join(siteDir, "_files")
+
+	if err := os.MkdirAll(filesDir, 0755); err != nil {
+		return err
+	}
+
+	// Write rewritten HTML
+	htmlPath := filepath.Join(siteDir, "index.html")
+	if err := os.WriteFile(htmlPath, []byte(data.siteHTML), 0644); err != nil {
+		return err
+	}
+
+	// Write every captured asset
+	for origURL, body := range data.siteResources {
+		localName, ok := data.siteFilenames[origURL]
+		if !ok {
+			continue
+		}
+		if assetPath := filepath.Join(filesDir, localName); true {
+			assetDir := filepath.Dir(assetPath)
+			os.MkdirAll(assetDir, 0755)
+			if err := os.WriteFile(assetPath, body, 0644); err != nil {
+				fmt.Printf("[WARN] Could not save asset %s: %v\n", localName, err)
+			}
+		}
+	}
+
+	fmt.Printf("[SITE] Saved to %s (%d assets)\n", siteDir, len(data.siteResources))
+	return nil
 }
 
 func saveScreenshot(onionAddr, fullURL string, screenshot []byte) error {
@@ -424,6 +642,9 @@ func formatResults(data *ScrapedData) string {
 	}
 	if data.htmlContent != "" {
 		parts = append(parts, fmt.Sprintf("html=%dKB", len(data.htmlContent)/1024))
+	}
+	if len(data.siteResources) > 0 {
+		parts = append(parts, fmt.Sprintf("site_assets=%d", len(data.siteResources)))
 	}
 	if len(parts) == 0 {
 		return "no data"
