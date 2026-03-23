@@ -1,0 +1,240 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mirror Discovery Portal</title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg: #0a0a0c;
+            --accent: #6d5dfc;
+            --text-main: #e0e0e0;
+            --text-dim: #a0a0a0;
+            --card-bg: rgba(255, 255, 255, 0.03);
+            --glass-border: rgba(255, 255, 255, 0.1);
+        }
+
+        body {
+            background: var(--bg);
+            color: var(--text-main);
+            font-family: 'Outfit', sans-serif;
+            margin: 0;
+            padding: 40px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        .container {
+            width: 100%;
+            max-width: 1000px;
+        }
+
+        header {
+            text-align: center;
+            margin-bottom: 60px;
+        }
+
+        h1 {
+            font-size: 3rem;
+            font-weight: 600;
+            background: linear-gradient(135deg, #fff 0%, var(--accent) 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 10px;
+        }
+
+        .stats {
+            color: var(--text-dim);
+            font-size: 0.9rem;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+        }
+
+        .search-area {
+            position: sticky;
+            top: 20px;
+            z-index: 100;
+            margin-bottom: 40px;
+        }
+
+        input[type="text"] {
+            width: 100%;
+            padding: 18px 25px;
+            background: rgba(0, 0, 0, 0.5);
+            border: 1px solid var(--glass-border);
+            backdrop-filter: blur(10px);
+            border-radius: 15px;
+            color: white;
+            font-size: 1.1rem;
+            outline: none;
+            transition: 0.3s;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+        }
+
+        input[type="text"]:focus {
+            border-color: var(--accent);
+            box-shadow: 0 0 20px rgba(109, 93, 252, 0.3);
+        }
+
+        #results {
+            display: grid;
+            gap: 25px;
+        }
+
+        .result-card {
+            background: var(--card-bg);
+            border: 1px solid var(--glass-border);
+            border-radius: 20px;
+            padding: 30px;
+            transition: 0.3s;
+            animation: fadeIn 0.5s ease-out forwards;
+        }
+
+        .result-card:hover {
+            transform: translateY(-5px);
+            background: rgba(255, 255, 255, 0.05);
+            border-color: var(--accent);
+        }
+
+        .result-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+
+        .title-text {
+            font-size: 1.4rem;
+            font-weight: 600;
+            color: white;
+        }
+
+        .mirror-count {
+            background: var(--accent);
+            padding: 5px 12px;
+            border-radius: 10px;
+            font-size: 0.8rem;
+            font-weight: 600;
+        }
+
+        .onion-list {
+            list-style: none;
+            padding: 0;
+            margin: 0;
+        }
+
+        .onion-item {
+            margin-top: 10px;
+            display: flex;
+            align-items: center;
+            word-break: break-all;
+        }
+
+        .onion-link {
+            color: #6da5ff;
+            text-decoration: none;
+            font-family: monospace;
+            font-size: 0.95rem;
+            opacity: 0.8;
+            transition: 0.2s;
+        }
+
+        .onion-link:hover {
+            opacity: 1;
+            text-decoration: underline;
+        }
+
+        .tag {
+            font-size: 0.7rem;
+            padding: 2px 6px;
+            border: 1px solid rgba(255,255,255,0.2);
+            border-radius: 5px;
+            margin-right: 10px;
+            color: var(--text-dim);
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .no-results {
+            text-align: center;
+            padding: 100px;
+            color: var(--text-dim);
+            font-style: italic;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Mirror Discovery Portal</h1>
+            <div class="stats">Indexed 7 Unique Titles | Total Mirrors Analyzed</div>
+        </header>
+
+        <div class="search-area">
+            <input type="text" id="searchInput" placeholder="Search by keywords or title..." onkeyup="filterResults()">
+        </div>
+
+        <div id="results">
+            <!-- Dynamic Results -->
+        </div>
+    </div>
+
+    <script>
+        const data = [{"title": "Tor Hidden Wiki Alpha", "onions": ["http://abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqraaaaaa.onion/"], "count": 1}, {"title": "Onion Social Messenger", "onions": ["http://bcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqraaaaaaa.onion/"], "count": 1}, {"title": "Secure Tor Mail", "onions": ["http://cdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqraaaaaaaa.onion/"], "count": 1}, {"title": "Ahmia \u2014 Search Tor Hidden Services", "onions": ["http://juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd.onion"], "count": 1}, {"title": "Underground Forum Portal", "onions": ["http://v3onionaddress1abcdefghijklmnopqrstuvwxyz234567abcdefgha.onion/"], "count": 1}, {"title": "Deep Web Marketplace", "onions": ["http://v3onionaddress2abcdefghijklmnopqrstuvwxyz234567abcdefgha.onion/"], "count": 1}, {"title": "Private Onion Link List", "onions": ["http://v3onionaddress3abcdefghijklmnopqrstuvwxyz234567abcdefgha.onion/"], "count": 1}];
+
+        function render(items) {
+            const container = document.getElementById('results');
+            container.innerHTML = '';
+            
+            if (items.length === 0) {
+                container.innerHTML = '<div class="no-results">No mirrors found matching those keywords.</div>';
+                return;
+            }
+
+            items.forEach(item => {
+                const card = document.createElement('div');
+                card.className = 'result-card';
+                
+                let onionsHtml = '';
+                item.onions.forEach(onion => {
+                    onionsHtml += `
+                        <div class="onion-item">
+                            <span class="tag">MIRROR</span>
+                            <a href="${onion}" class="onion-link" target="_blank">${onion}</a>
+                        </div>
+                    `;
+                });
+
+                card.innerHTML = `
+                    <div class="result-header">
+                        <div class="title-text">${item.title}</div>
+                        <div class="mirror-count">${item.count} ADDRESSES</div>
+                    </div>
+                    <div class="onion-list">
+                        ${onionsHtml}
+                    </div>
+                `;
+                container.appendChild(card);
+            });
+        }
+
+        function filterResults() {
+            const query = document.getElementById('searchInput').value.toLowerCase();
+            const filtered = data.filter(item => 
+                item.title.toLowerCase().includes(query) || 
+                item.onions.some(o => o.toLowerCase().includes(query))
+            );
+            render(filtered);
+        }
+
+        // Initial render
+        render(data);
+    </script>
+</body>
+</html>

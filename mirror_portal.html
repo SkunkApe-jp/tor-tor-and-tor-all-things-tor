@@ -1,0 +1,185 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mirror Discovery & Link Aggregator</title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600&family=JetBrains+Mono&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        :root {
+            --bg: #050505;
+            --accent: #6d5dfc;
+            --card: rgba(255, 255, 255, 0.02);
+            --border: rgba(255, 255, 255, 0.08);
+            --text: #eee;
+            --dim: #666;
+        }
+
+        body, html {
+            margin: 0; padding: 0; min-height: 100vh;
+            background-color: var(--bg); color: var(--text);
+            font-family: 'Outfit', sans-serif;
+        }
+
+        main {
+            display: flex; flex-direction: column; align-items: center;
+            padding: 40px; min-height: 100vh;
+        }
+
+        .container { width: 100%; max-width: 1000px; }
+
+        h1 {
+            font-size: 2.8rem; text-align: center; margin-bottom: 40px;
+            background: linear-gradient(135deg, #fff 0%, var(--accent) 100%);
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+        }
+
+        .search-box {
+            width: 100%; background: var(--card);
+            border: 1px solid var(--border); border-radius: 15px;
+            padding: 20px 30px; display: flex; align-items: center;
+            backdrop-filter: blur(20px); transition: 0.3s;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.4);
+        }
+
+        .search-box:focus-within { border-color: var(--accent); }
+
+        #searchInput {
+            background: transparent; border: none; outline: none;
+            color: white; font-size: 1.2rem; width: 100%;
+            margin-left: 15px;
+        }
+
+        .label {
+            font-size: 0.7rem; color: var(--dim);
+            text-transform: uppercase; letter-spacing: 2px;
+            margin: 30px 0 10px 0; display: block;
+        }
+
+        #masterLinkBox {
+            width: 100%; height: 250px;
+            background: #000; border: 1px solid var(--border);
+            border-radius: 12px; color: #6da5ff;
+            font-family: 'JetBrains Mono', monospace; font-size: 0.9rem;
+            padding: 20px; outline: none; transition: 0.3s;
+            resize: vertical;
+        }
+
+        #masterLinkBox:focus { border-color: var(--accent); }
+
+        #results {
+            margin-top: 50px; display: grid; gap: 30px;
+        }
+
+        .group-card {
+            background: var(--card); border: 1px solid var(--border);
+            border-radius: 20px; padding: 25px;
+            animation: fadeIn 0.4s ease forwards;
+        }
+
+        .group-header {
+            display: flex; justify-content: space-between; align-items: center;
+            margin-bottom: 20px;
+        }
+
+        .title { font-size: 1.4rem; font-weight: 600; color: #fff; }
+        .badge { 
+            background: var(--accent); color: white; padding: 4px 12px;
+            border-radius: 20px; font-size: 0.75rem; 
+        }
+
+        .mirror-list {
+            display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+            gap: 15px;
+        }
+
+        .onion-info {
+            display: flex; align-items: center; gap: 15px;
+            background: rgba(0,0,0,0.2); border: 1px solid var(--border);
+            padding: 12px; border-radius: 10px;
+        }
+
+        .thumb {
+            width: 50px; height: 50px; object-fit: cover;
+            border-radius: 6px; border: 1px solid var(--border);
+        }
+
+        .addr {
+            font-family: 'JetBrains Mono', monospace; font-size: 0.8rem;
+            color: var(--dim); overflow: hidden; text-overflow: ellipsis;
+        }
+
+        @keyframes fadeIn { from{opacity:0; transform:translateY(10px);} to{opacity:1; transform:translateY(0);} }
+    </style>
+</head>
+<body>
+
+    <main>
+        <div class="container">
+            <h1>Mirror Discovery Portal</h1>
+
+            <div class="search-box">
+                <i class="fas fa-search" style="opacity: 0.5"></i>
+                <input type="text" id="searchInput" placeholder="Search by identity, onion, or keyword..." onkeyup="filter()">
+            </div>
+
+            <span class="label">Master Mirrror Link Box (Copy-Paste)</span>
+            <textarea id="masterLinkBox" readonly placeholder="Matching onion addresses will appear here..."></textarea>
+
+            <div id="results"></div>
+        </div>
+    </main>
+
+    <script>
+        const groups = [{"title": "Tor Hidden Wiki Alpha", "onions": [{"addr": "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqraaaaaa", "url": "http://abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqraaaaaa.onion", "img": ""}], "count": 1}, {"title": "Onion Social Messenger", "onions": [{"addr": "bcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqraaaaaaa", "url": "http://bcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqraaaaaaa.onion", "img": ""}], "count": 1}, {"title": "Secure Tor Mail", "onions": [{"addr": "cdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqraaaaaaaa", "url": "http://cdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqraaaaaaaa.onion", "img": ""}], "count": 1}, {"title": "Ahmia \u2014 Search Tor Hidden Services", "onions": [{"addr": "juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd", "url": "http://juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd.onion", "img": "scraped_data/juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd/images/index.png"}], "count": 1}, {"title": "Deep Web Marketplace", "onions": [{"addr": "v3onionaddress2abcdefghijklmnopqrstuvwxyz234567abcdefgha", "url": "http://v3onionaddress2abcdefghijklmnopqrstuvwxyz234567abcdefgha.onion", "img": ""}], "count": 1}, {"title": "Private Onion Link List", "onions": [{"addr": "v3onionaddress3abcdefghijklmnopqrstuvwxyz234567abcdefgha", "url": "http://v3onionaddress3abcdefghijklmnopqrstuvwxyz234567abcdefgha.onion", "img": ""}], "count": 1}, {"title": "visualizations", "onions": [{"addr": "visualizations", "url": "http://visualizations.onion", "img": ""}], "count": 1}];
+
+        function render(filtered) {
+            const results = document.getElementById('results');
+            const linkBox = document.getElementById('masterLinkBox');
+            results.innerHTML = "";
+            let allLinks = [];
+
+            filtered.forEach(group => {
+                const groupEl = document.createElement('div');
+                groupEl.className = "group-card";
+                
+                let mirrorHtml = "";
+                group.onions.forEach(onion => {
+                    allLinks.push(onion.url);
+                    mirrorHtml += `
+                        <div class="onion-info">
+                            <img class="thumb" src="${onion.img}" onerror="this.src='https://placehold.co/50x50?text=?'">
+                            <div class="addr">${onion.addr}.onion</div>
+                        </div>
+                    `;
+                });
+
+                groupEl.innerHTML = `
+                    <div class="group-header">
+                        <div class="title">${group.title}</div>
+                        <div class="badge">${group.count} MIRRORS</div>
+                    </div>
+                    <div class="mirror-list">${mirrorHtml}</div>
+                `;
+                results.appendChild(groupEl);
+            });
+
+            linkBox.value = allLinks.join('\n');
+        }
+
+        function filter() {
+            const q = document.getElementById('searchInput').value.toLowerCase();
+            const filtered = groups.filter(g => 
+                g.title.toLowerCase().includes(q) || 
+                g.onions.some(o => o.addr.toLowerCase().includes(q))
+            );
+            render(filtered);
+        }
+
+        // Initial Render
+        render(groups);
+    </script>
+</body>
+</html>
