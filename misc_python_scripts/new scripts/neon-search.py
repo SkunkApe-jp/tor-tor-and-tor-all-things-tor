@@ -32,7 +32,7 @@ def parse_full_intelligence(log_path, scraped_dir, output_path):
                 title_file = item / "website_identity" / "index_title.txt"
                 if title_file.exists():
                     try:
-                        content = title_file.read_text().strip()
+                        content = title_file.read_text(encoding='utf-8').strip()
                         # Extract part inside [ ]
                         title_match = re.search(r'\[(.*?)\]', content)
                         if title_match:

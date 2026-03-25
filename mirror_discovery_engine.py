@@ -1,247 +1,279 @@
+#!/usr/bin/env python3
 import os
 import re
 import json
+import time
 from pathlib import Path
 from collections import defaultdict
 
-# Configuration
+# --- CONFIGURATION ---
 SCRAPED_DATA_DIR = "./scraped_data"
-LOG_FILE = "./logs/unified_scraper.log"
-OUTPUT_HTML = "mirror_discovery_portal.html"
+PORTAL_HTML_FILE = "mirror_discovery_portal.html"
+BOOKMARK_FILE = "tor_mirror_bookmarks.html"
 
-def get_onion_intel():
+def get_mirror_intelligence():
     """
-    Crawls local data to build a grouped index of mirrors.
-    Groups by Title -> List of Onions with their metadata.
+    Crawls local data to define mirrors.
+    RULE: Identical content inside [brackets] in website_identity/index_title.txt = MIRROR.
     """
-    groups = defaultdict(list) # title -> list of {addr, img, status}
+    mirror_groups = defaultdict(list)
     base_path = Path(SCRAPED_DATA_DIR)
     
+    # 1. Gather Mirror Intel
     if not base_path.exists():
-        print(f"[ERROR] Directory {SCRAPED_DATA_DIR} not found.")
+        print(f"[ERROR] {SCRAPED_DATA_DIR} not found.")
         return {}
 
-    # 1. Index titles and group onions
-    for item in base_path.iterdir():
-        if item.is_dir() and (len(item.name) == 56 or len(item.name) == 16):
-            addr = item.name
-            
-            # Fetch Title
-            title = "Unknown Site"
-            # We look for any title file in website_identity
-            identity_dir = item / "website_identity"
-            if identity_dir.exists():
-                for title_file in identity_dir.glob("*_title.txt"):
-                    try:
-                        content = title_file.read_text(encoding='utf-8').strip()
-                        # Extract part inside [ ]
-                        title_match = re.search(r'\[(.*?)\]', content)
-                        if title_match:
-                            title = title_match.group(1).strip()
-                            break 
-                    except: pass
+    # Valid onion address (v2/v3)
+    onion_pattern = re.compile(r'^[a-z2-7]{16}$|^[a-z2-7]{56}$')
 
-            # Fetch Image and Viz
+    for item in base_path.iterdir():
+        if item.is_dir():
+            addr = item.name
+            # Simplified title extraction as per user requirement
+            title = addr # Fallback
+            
+            title_file = item / "website_identity" / "index_title.txt"
+            if title_file.exists():
+                try:
+                    content = title_file.read_text(encoding='utf-8').strip()
+                    # Rule: find part inside [ ]
+                    match = re.search(r'\[(.*?)\]', content)
+                    if match:
+                        title = match.group(1).strip()
+                except: pass
+            
+            # Metadata for current target
             img_path = item / "images" / "index.png"
             rel_img = ""
             if img_path.exists():
                 rel_img = f"scraped_data/{addr}/images/index.png"
 
-            groups[title].append({
-                "addr": addr,
-                "url": f"http://{addr}.onion",
-                "img": rel_img
+            mirror_groups[title].append({
+                "address": addr,
+                "url": f"http://{addr}.onion/",
+                "image": rel_img
             })
-    
-    return groups
+            
+    return mirror_groups
 
-def generate_portal(groups):
-    # Prepare data for JS
+def generate_discovery_portal(groups):
+    """
+    Outputs the High-End Search Portal for mirror lists.
+    """
     data_list = []
     for title, onions in groups.items():
-        data_list.append({
-            "title": title,
-            "onions": onions,
-            "count": len(onions)
-        })
+        data_list.append({"title": title, "onions": onions, "count": len(onions)})
     
-    # Sort by mirror count descending
     data_list.sort(key=lambda x: x['count'], reverse=True)
-
-    html_template = f"""<!DOCTYPE html>
+    json_data = json.dumps(data_list)
+    
+    html = f"""
+<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Mirror Discovery Portal</title>
-    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600&display=swap" rel="stylesheet">
+    <title>Mirror Discovery & Zero-In Tool</title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600&family=JetBrains+Mono&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
         :root {{
-            --bg: #050505;
+            --bg: #030303;
             --accent: #6d5dfc;
-            --text: #ffffff;
-            --dim: #a0a0a0;
-            --card: rgba(255, 255, 255, 0.03);
+            --glass: rgba(255, 255, 255, 0.04);
             --border: rgba(255, 255, 255, 0.1);
+            --text: #ffffff;
+            --dim: #777;
         }}
 
-        body {{
-            background: var(--bg);
-            color: var(--text);
+        body, html {{
+            margin: 0; padding: 0; min-height: 100vh;
+            background-color: var(--bg); color: var(--text);
             font-family: 'Outfit', sans-serif;
-            margin: 0; padding: 40px;
-            display: flex; flex-direction: column; align-items: center;
+            overflow-x: hidden;
+            display: flex; flex-direction: column; align-items: center; justify-content: center;
         }}
 
-        .container {{ width: 100%; max-width: 1100px; }}
+        #mainFrame {{
+            width: 100%; max-width: 90%;
+            text-align: center;
+            transition: all 0.3s;
+        }}
+
+        #mainFrame.searched {{
+            transform: translateY(-20vh);
+        }}
 
         h1 {{
-            font-size: 2.5rem; text-align: center;
+            font-size: 3rem; margin-bottom: 50px;
             background: linear-gradient(135deg, #fff 0%, var(--accent) 100%);
             -webkit-background-clip: text; -webkit-text-fill-color: transparent;
         }}
 
-        .search-section {{
-            position: sticky; top: 0; z-index: 100;
-            background: var(--bg); padding: 20px 0;
+        .search-area {{
+            width: 100%; max-width: 800px; margin: 0 auto;
+            background: var(--glass); backdrop-filter: blur(20px);
+            border: 1px solid var(--border); border-radius: 60px;
+            padding: 8px 30px; display: flex; align-items: center;
         }}
 
-        input[type="text"] {{
-            width: 100%; padding: 20px;
-            background: rgba(255,255,255,0.05);
-            border: 1px solid var(--border); border-radius: 12px;
-            color: white; font-size: 1.1rem; outline: none;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+        #searchInput {{
+            background: transparent; border: none; outline: none;
+            color: white; font-size: 1.4rem; width: 100%; padding: 15px;
+            font-family: 'Outfit', sans-serif;
         }}
 
-        #masterLinkBox {{
-            width: 100%; height: 180px;
-            background: #000; border: 1px solid var(--accent);
-            border-radius: 12px; color: #a0c4ff;
-            font-family: 'Courier New', Courier, monospace;
-            padding: 15px; margin-top: 15px;
-            font-size: 0.9rem; resize: vertical;
+        #loader {{ display: none; margin-top: 50px; flex-direction: column; align-items: center; }}
+        .spinner {{
+            width: 40px; height: 40px; border: 3px solid rgba(255,255,255,0.05);
+            border-top: 3px solid var(--accent); border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+        }}
+        @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
+
+        .result-box {{
+            display: none; width: 100%; margin-top: 60px;
+            background: var(--glass); border: 1px solid var(--border);
+            border-radius: 30px; padding: 50px;
+            animation: slideUp 0.5s ease-out;
         }}
 
-        .label {{
-            font-size: 0.7rem; color: var(--dim);
-            text-transform: uppercase; letter-spacing: 2px;
-            display: block; margin-top: 20px;
+        .link-paragraph {{
+            font-family: 'JetBrains Mono', monospace; font-size: 1.1rem;
+            line-height: 2.5; text-align: center; color: #6da5ff;
         }}
 
-        #results {{ margin-top: 40px; display: grid; gap: 30px; }}
-
-        .group-card {{
-            background: var(--card); border: 1px solid var(--border);
-            border-radius: 20px; padding: 0; overflow: hidden;
-            display: flex; flex-direction: column;
-            transition: 0.3s;
+        .link-paragraph a {{
+            color: #6da5ff; text-decoration: none; border-bottom: 1px solid transparent;
+            margin: 0 10px; transition: 0.2s;
         }}
 
-        .group-card:hover {{ border-color: var(--accent); }}
+        .link-paragraph a:hover {{ color: white; border-color: white; }}
 
-        .group-header {{
-            padding: 25px; background: rgba(255,255,255,0.02);
-            border-bottom: 1px solid var(--border);
-            display: flex; justify-content: space-between; align-items: center;
+        .meta-zero {{
+            margin-bottom: 40px; font-size: 0.8rem; color: var(--dim);
+            letter-spacing: 2px; text-transform: uppercase;
         }}
 
-        .group-title {{ font-size: 1.5rem; font-weight: 600; }}
-        .badge {{ background: var(--accent); padding: 4px 12px; border-radius: 20px; font-size: 0.75rem; }}
-
-        .mirror-grid {{
-            display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
-            gap: 20px; padding: 25px;
-        }}
-
-        .onion-card {{
-            background: rgba(0,0,0,0.3); border: 1px solid var(--border);
-            border-radius: 12px; padding: 15px;
-        }}
-
-        .preview-img {{
-            width: 100%; height: 120px; object-fit: cover;
-            border-radius: 8px; margin-bottom: 10px;
-            background: #111;
-        }}
-
-        .onion-addr {{
-            font-family: monospace; font-size: 0.8rem;
-            color: #6da5ff; text-decoration: none;
-            overflow-wrap: break-word;
-        }}
+        @keyframes slideUp {{ from {{ opacity: 0; transform: translateY(40px); }} to {{ opacity: 1; transform: translateY(0); }} }}
     </style>
 </head>
 <body>
-    <div class="container">
+    <div id="mainFrame">
         <h1>Mirror Discovery</h1>
         
-        <div class="search-section">
-            <span class="label">Keyword Filter</span>
-            <input type="text" id="searchInput" placeholder="Search by mirrors or identity..." onkeyup="filter()">
-            
-            <span class="label">Master Mirror List (Copy-Paste)</span>
-            <textarea id="masterLinkBox" readonly></textarea>
+        <div class="search-area">
+            <i class="fas fa-search" style="opacity: 0.3; font-size: 1.4rem;"></i>
+            <input type="text" id="searchInput" placeholder="Zero-in on identities..." autocomplete="off">
         </div>
 
-        <div id="results"></div>
+        <div id="loader">
+            <div class="spinner"></div>
+            <p style="margin-top: 20px; color: var(--accent); font-size: 0.7rem;">CALCULATING MIRROR CLUSTERS...</p>
+        </div>
+
+        <div id="resultBox" class="result-box">
+            <div class="meta-zero" id="metaZero"></div>
+            <div class="link-paragraph" id="lp"></div>
+        </div>
     </div>
 
     <script>
-        const groups = {json.dumps(data_list)};
+        const database = {json_data};
+        const searchInput = document.getElementById('searchInput');
+        const mainFrame = document.getElementById('mainFrame');
+        const loader = document.getElementById('loader');
+        const resultBox = document.getElementById('resultBox');
+        const lp = document.getElementById('lp');
+        const metaZero = document.getElementById('metaZero');
 
-        function render(filtered) {{
-            const results = document.getElementById('results');
-            const linkBox = document.getElementById('masterLinkBox');
-            results.innerHTML = "";
-            let allLinks = [];
+        let debounce = null;
 
-            filtered.forEach(group => {{
-                const groupEl = document.createElement('div');
-                groupEl.className = "group-card";
-                
-                let mirrorHtml = "";
-                group.onions.forEach(onion => {{
-                    allLinks.push(onion.url);
-                    mirrorHtml += `
-                        <div class="onion-card">
-                            <img class="preview-img" src="${{onion.img}}" onerror="this.src='https://placehold.co/320x180?text=No+Preview'">
-                            <a href="${{onion.url}}" class="onion-addr" target="_blank">${{onion.addr}}.onion</a>
-                        </div>
-                    `;
-                }});
+        searchInput.addEventListener('input', (e) => {{
+            const query = e.target.value.toLowerCase().trim();
+            clearTimeout(debounce);
 
-                groupEl.innerHTML = `
-                    <div class="group-header">
-                        <div class="group-title">${{group.title}}</div>
-                        <div class="badge">${{group.count}} MIRRORS DETECTED</div>
-                    </div>
-                    <div class="mirror-grid">${{mirrorHtml}}</div>
-                `;
-                results.appendChild(groupEl);
-            }});
+            if (query.length === 0) {{
+                mainFrame.classList.remove('searched');
+                loader.style.display = 'none';
+                resultBox.style.display = 'none';
+                return;
+            }}
 
-            linkBox.value = allLinks.join('\\n');
+            mainFrame.classList.add('searched');
+            resultBox.style.display = 'none';
+            loader.style.display = 'flex';
+
+            debounce = setTimeout(() => {{
+                processSearch(query);
+            }}, 800);
+        }});
+
+        function processSearch(q) {{
+            loader.style.display = 'none';
+            let uniqueOnions = new Set();
+            let matchedTitles = [];
+
+            for (const item of database) {{
+                if (item.title.toLowerCase().includes(q) || item.onions.some(o => o.address.toLowerCase().includes(q))) {{
+                    matchedTitles.push(item.title);
+                    item.onions.forEach(o => uniqueOnions.add(o.url));
+                }}
+            }}
+
+            if (uniqueOnions.size > 0) {{
+                resultBox.style.display = 'block';
+                metaZero.innerText = `Zeroed In: ${{uniqueOnions.size}} Mirrors Found`;
+                lp.innerHTML = Array.from(uniqueOnions).map(url => {{
+                    return `<a href="${{url}}" target="_blank">${{url}}</a>`;
+                }}).join(' ');
+            }} else {{
+                resultBox.style.display = 'block';
+                metaZero.innerText = "No mirrors detected";
+                lp.innerHTML = "<span style='color:var(--dim)'>Try a partial identity title or onion string.</span>";
+            }}
         }}
-
-        function filter() {{
-            const q = document.getElementById('searchInput').value.toLowerCase();
-            const filtered = groups.filter(g => 
-                g.title.toLowerCase().includes(q) || 
-                g.onions.some(o => o.addr.toLowerCase().includes(q))
-            );
-            render(filtered);
-        }}
-
-        render(groups);
     </script>
 </body>
-</html>"""
-    with open(OUTPUT_HTML, 'w', encoding='utf-8') as f:
-        f.write(html_template)
-    print(f"[SUCCESS] Discovery Portal generated: {OUTPUT_HTML}")
+</html>
+"""
+    with open(PORTAL_HTML_FILE, 'w', encoding='utf-8') as f:
+        f.write(html)
+
+def generate_bookmarks(groups):
+    """
+    Outputs the Netscape Bookmark file for Tor.
+    """
+    ts = int(time.time())
+    
+    header = f"""<!DOCTYPE NETSCAPE-Bookmark-file-1>
+<META HTTP-EQUIV="Content-Type" CONTENT="text/html; charset=UTF-8">
+<TITLE>Mirror Bookmarks</TITLE>
+<H1>Bookmarks Menu</H1>
+<DL><p>
+    <DT><H3 ADD_DATE="{ts}" LAST_MODIFIED="{ts}">Mirror Identity Clusters</H3>
+    <DL><p>"""
+    
+    with open(BOOKMARK_FILE, 'w', encoding='utf-8') as f:
+        f.write(header)
+        for title, onions in groups.items():
+            safe_title = title.replace("&", "&amp;").replace("<", "&lt;")
+            f.write(f'        <DT><H3 ADD_DATE="{ts}" LAST_MODIFIED="{ts}">{safe_title}</H3>\n')
+            f.write('        <DL><p>\n')
+            for onion in onions:
+                f.write(f'            <DT><A HREF="{onion["url"]}" ADD_DATE="{ts}">{onion["url"]}</A>\n')
+            f.write('        </DL><p>\n')
+        f.write('    </DL><p>\n</DL>\n')
 
 if __name__ == "__main__":
-    print("[INIT] Indexing mirrors by identity...")
-    groups = get_onion_intel()
-    generate_portal(groups)
+    print("[INIT] Mirror Discovery Engine Starting...")
+    intel = get_mirror_intelligence()
+    if intel:
+        print(f"[PROCESS] Indexed {len(intel)} Unique Identities.")
+        generate_discovery_portal(intel)
+        generate_bookmarks(intel)
+        print(f"[SUCCESS] Mirror Portal ready: {PORTAL_HTML_FILE}")
+        print(f"[SUCCESS] Mirror Bookmarks ready: {BOOKMARK_FILE}")
+    else:
+        print("[WARN] No data found in scraped_data.")
