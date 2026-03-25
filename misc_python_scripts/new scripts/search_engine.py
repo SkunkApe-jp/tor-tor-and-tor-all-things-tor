@@ -6,75 +6,36 @@ import argparse
 from pathlib import Path
 from collections import defaultdict
 
-# Pre-compiled regex for onion address validation (v2: 16 chars, v3: 56 chars, or vanity: <=56 chars)
+# Pre-compiled regex for onion address validation
 ONION_PATTERN = re.compile(r'^[a-z2-7]{1,56}$')
 
 def parse_full_intelligence(log_path, scraped_dir, output_path):
     """
-    Crawls local data to build a searchable index with:
-    - Titles from website_identity/index_title.txt
-    - Screenshots from images/index.png
-    - Existing Viz from visualizations/addr_viz.html
-    - Reliability history from unified_scraper.log
+    Crawls local data to build a mirror index grouped by title.
     """
-    onion_index = {}
+    groups = defaultdict(list)
     base_scraped = Path(scraped_dir)
-    output_dir = os.path.dirname(os.path.abspath(output_path))
     
-    # 1. Gather Site Intelligence
     if base_scraped.exists():
         for item in base_scraped.iterdir():
             if item.is_dir() and ONION_PATTERN.match(item.name):
                 addr = item.name
-                
-                # Fetch Title
                 title = addr  # Fallback
                 title_file = item / "website_identity" / "index_title.txt"
                 if title_file.exists():
                     try:
-                        content = title_file.read_text().strip()
-                        # Extract part inside [ ]
+                        content = title_file.read_text(encoding='utf-8').strip()
                         title_match = re.search(r'\[(.*?)\]', content)
                         if title_match:
-                            title = title_match.group(1)
+                            title = title_match.group(1).strip()
                     except: pass
 
-                # Paths relative to the output HTML file
-                img_path = item / "images" / "index.png"
-                viz_path = item / "visualizations" / f"{addr}_viz.html"
-                
-                # Verify paths and normalize for web
-                rel_img = ""
-                if img_path.exists():
-                    rel_img = os.path.relpath(img_path, output_dir).replace("\\", "/")
-                
-                rel_viz = ""
-                if viz_path.exists():
-                    rel_viz = os.path.relpath(viz_path, output_dir).replace("\\", "/")
-
-                onion_index[addr] = {
-                    "title": title,
-                    "image": rel_img,
-                    "viz": rel_viz,
-                    "history": []
-                }
-
-    # 2. Add Log History for the card viz
-    # Support v2 (16 chars), v3 (56 chars), and vanity addresses (1-56 chars)
-    log_pattern = re.compile(r'\[(.*?)\] (https?://([a-z2-7]{1,56})\.onion/?) -> (\w+) \((.*?)\)')
-    if os.path.exists(log_path):
-        with open(log_path, 'r') as f:
-            for line in f:
-                match = log_pattern.search(line)
-                if match:
-                    ts, _, addr, status, _ = match.groups()
-                    if addr in onion_index:
-                        onion_index[addr]["history"].append({"ts": ts, "status": status})
+                groups[title].append(f"http://{addr}.onion")
     
-    return onion_index
+    return groups
 
-def generate_html(data, output_file):
-    json_data = json.dumps(data)
+def generate_html(groups, output_file):
+    json_data = json.dumps(groups)
     
     html = f"""
 <!DOCTYPE html>
@@ -82,161 +43,201 @@ def generate_html(data, output_file):
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Search </title>
-    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <title>Mirror Discovery Portal</title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600&family=JetBrains+Mono&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
         :root {{
-            --bg: #050505;
+            --bg: #030303;
+            --accent: #6d5dfc;
             --glass: rgba(255, 255, 255, 0.03);
-            --border: rgba(255, 255, 255, 0.08);
-            --accent: #ffffff;
-            --dim: #555;
+            --border: rgba(255, 255, 255, 0.1);
+            --text: #ffffff;
+            --dim: #777;
         }}
 
         body, html {{
             margin: 0; padding: 0; min-height: 100vh;
-            background-color: var(--bg); color: #eee;
-            font-family: 'Inter', -apple-system, sans-serif;
+            background-color: var(--bg); color: var(--text);
+            font-family: 'Outfit', sans-serif;
             overflow-x: hidden;
+            display: flex; flex-direction: column; align-items: center; justify-content: center;
         }}
 
-        /* Splash State Logic */
-        main {{
-            display: flex; flex-direction: column; align-items: center;
-            transition: all 0.6s cubic-bezier(0.16, 1, 0.3, 1);
-            min-height: 100vh; justify-content: center; /* Initial center */
+        /* --- SPLASH STATE --- */
+        #mainContainer {{
+            width: 100%; max-width: 900px;
+            text-align: center;
+            transition: all 0.8s cubic-bezier(0.16, 1, 0.3, 1);
         }}
 
-        main.searched {{
-            min-height: auto; justify-content: flex-start; padding-top: 50px;
+        #mainContainer.searched {{
+            transform: translateY(-20vh);
         }}
 
-        /* Search Bar */
-        .search-container {{
-            width: 90%; max-width: 1100px; position: relative;
+        h1 {{
+            font-size: 3.5rem; letter-spacing: -2px; margin-bottom: 50px;
+            background: linear-gradient(135deg, #fff 0%, var(--accent) 100%);
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+            font-weight: 600;
         }}
 
-        .search-inner {{
-            display: flex; align-items: center;
+        .search-area {{
+            width: 100%; position: relative;
             background: var(--glass); backdrop-filter: blur(20px);
-            border: 1px solid var(--border); border-radius: 2px;
-            padding: 5px 25px; transition: border 0.3s;
+            border: 1px solid var(--border); border-radius: 60px;
+            padding: 8px 35px; display: flex; align-items: center;
+            transition: 0.3s;
         }}
 
-        .search-inner:focus-within {{ border-color: rgba(255,255,255,0.25); }}
+        .search-area:focus-within {{ 
+            border-color: var(--accent);
+            box-shadow: 0 0 40px rgba(109, 93, 252, 0.15);
+        }}
 
         #searchInput {{
             background: transparent; border: none; outline: none;
-            color: white; font-size: 1.2rem; width: 100%; padding: 20px;
+            color: white; font-size: 1.4rem; width: 100%; padding: 18px;
+            font-family: 'Outfit', sans-serif;
+        }}
+
+        /* --- LOADING SPINNER --- */
+        #loader {{
+            display: none; margin-top: 60px;
+            flex-direction: column; align-items: center;
+            animation: fadeIn 0.4s ease;
+        }}
+
+        .spinner {{
+            width: 50px; height: 50px;
+            border: 3px solid rgba(255,255,255,0.05);
+            border-top: 3px solid var(--accent);
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+        }}
+
+        @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
+
+        /* --- LINK PARAGRAPH BOX --- */
+        #resultBox {{
+            display: none; width: 100%; margin-top: 50px;
+            background: var(--glass); border: 1px solid var(--border);
+            border-radius: 30px; padding: 50px;
+            box-shadow: 0 20px 50px rgba(0,0,0,0.5);
+            animation: slideUp 0.6s cubic-bezier(0.16, 1, 0.3, 1);
+        }}
+
+        .meta-info {{
+            text-align: center; margin-bottom: 35px;
+            color: var(--dim); font-size: 0.8rem;
+            text-transform: uppercase; letter-spacing: 3px;
+        }}
+
+        .link-container {{
             font-family: 'JetBrains Mono', monospace;
+            font-size: 1.05rem; line-height: 2.2;
+            text-align: justify; color: #6da5ff;
+            word-break: break-all;
         }}
 
-        /* Results Grid */
-        #results {{
-            width: 90%; max-width: 1100px; margin-top: 50px;
-            display: grid; grid-template-columns: 1fr; gap: 30px;
-            padding-bottom: 100px; display: none;
+        .link-container a {{
+            color: #6da5ff; text-decoration: none;
+            padding: 0 8px; transition: 0.2s;
+            display: inline-block;
         }}
 
-        .card {{
-            display: flex; gap: 30px; background: rgba(255,255,255,0.01);
-            border: 1px solid var(--border); padding: 25px; border-radius: 4px;
-            animation: fadeIn 0.5s ease forwards;
+        .link-container a:hover {{
+            color: white; transform: scale(1.05);
+            text-shadow: 0 0 10px rgba(109, 93, 252, 0.5);
         }}
 
-        @keyframes fadeIn {{ from{{opacity:0; transform:translateY(10px);}} to{{opacity:1; transform:translateY(0);}} }}
-
-        .thumb-box {{ width: 320px; flex-shrink: 0; position: relative; }}
-        .thumb {{ width: 100%; height: 180px; object-fit: cover; border: 1px solid var(--border); }}
-
-        .info {{ flex: 1; display: flex; flex-direction: column; }}
-        .title {{ font-size: 1.4rem; color: var(--accent); text-decoration: none; margin-bottom: 8px; font-weight: 500; }}
-        .title:hover {{ text-decoration: underline; }}
-        
-        .addr {{ font-family: monospace; font-size: 0.8rem; color: var(--dim); margin-bottom: 20px; }}
-
-        /* Card Actions */
-        .actions {{ margin-top: auto; display: flex; gap: 20px; align-items: center; }}
-        .btn-viz {{ 
-            font-size: 0.7rem; text-transform: uppercase; letter-spacing: 1px;
-            color: #fff; text-decoration: none; border: 1px solid #333;
-            padding: 8px 15px; border-radius: 2px; transition: 0.2s;
+        @keyframes fadeIn {{ from{{opacity:0;}} to{{opacity:1;}} }}
+        @keyframes slideUp {{
+            from {{ opacity: 0; transform: translateY(40px); }}
+            to {{ opacity: 1; transform: translateY(0); }}
         }}
-        .btn-viz:hover {{ background: #fff; color: #000; }}
 
-        /* Small Reliability Sparkline */
-        .sparkline {{ display: flex; gap: 3px; }}
-        .dot {{ width: 4px; height: 12px; border-radius: 1px; }}
     </style>
 </head>
 <body>
 
-    <main id="mainFrame">
-        <div class="search-container">
-            <div class="search-inner">
-                <i class="fas fa-search" style="opacity: 0.2; font-size: 1.2rem;"></i>
-                <input type="text" id="searchInput" placeholder="Search Title or Onion..." autocomplete="off">
-            </div>
+    <div id="mainContainer">
+        <h1>Mirror Finder</h1>
+        
+        <div class="search-area">
+            <i class="fas fa-search" style="opacity: 0.3; font-size: 1.4rem;"></i>
+            <input type="text" id="searchInput" placeholder="Search Title or Keyword..." autocomplete="off">
         </div>
 
-        <div id="results"></div>
-    </main>
+        <div id="loader">
+            <div class="spinner"></div>
+            <p style="margin-top: 20px; color: var(--accent); font-size: 0.8rem; letter-spacing: 2px;">AGGREGATING MIRROR LINKS...</p>
+        </div>
+
+        <div id="resultBox">
+            <div class="meta-info" id="resultMeta"></div>
+            <div class="link-container" id="linkList"></div>
+        </div>
+    </div>
 
     <script>
         const database = {json_data};
-        const searchBox = document.getElementById('searchInput');
-        const resultsDiv = document.getElementById('results');
-        const mainFrame = document.getElementById('mainFrame');
+        const searchInput = document.getElementById('searchInput');
+        const mainContainer = document.getElementById('mainContainer');
+        const loader = document.getElementById('loader');
+        const resultBox = document.getElementById('resultBox');
+        const linkList = document.getElementById('linkList');
+        const resultMeta = document.getElementById('resultMeta');
 
-        searchBox.addEventListener('input', (e) => {{
+        let debounce = null;
+
+        searchInput.addEventListener('input', (e) => {{
             const query = e.target.value.toLowerCase().trim();
-            
-            if (query.length > 0) {{
-                mainFrame.classList.add('searched');
-                resultsDiv.style.display = 'grid';
-                performSearch(query);
-            }} else {{
-                mainFrame.classList.remove('searched');
-                resultsDiv.style.display = 'none';
+            clearTimeout(debounce);
+
+            if (query.length === 0) {{
+                mainContainer.classList.remove('searched');
+                loader.style.display = 'none';
+                resultBox.style.display = 'none';
+                return;
             }}
+
+            // Enter Search State
+            mainContainer.classList.add('searched');
+            resultBox.style.display = 'none';
+            loader.style.display = 'flex';
+
+            debounce = setTimeout(() => {{
+                processDiscovery(query);
+            }}, 900);
         }});
 
-        function performSearch(q) {{
-            resultsDiv.innerHTML = "";
-            const matches = Object.keys(database).filter(addr => {{
-                const site = database[addr];
-                return addr.includes(q) || site.title.toLowerCase().includes(q);
-            }});
+        function processDiscovery(q) {{
+            loader.style.display = 'none';
+            
+            let uniqueOnions = new Set();
+            let matches = 0;
 
-            matches.forEach(addr => {{
-                const site = database[addr];
-                const card = document.createElement('div');
-                card.className = 'card';
+            for (const [title, onions] of Object.entries(database)) {{
+                if (title.toLowerCase().includes(q) || onions.some(o => o.toLowerCase().includes(q))) {{
+                    matches++;
+                    onions.forEach(o => uniqueOnions.add(o));
+                }}
+            }}
+
+            if (uniqueOnions.size > 0) {{
+                resultBox.style.display = 'block';
+                resultMeta.innerText = `Matches Found: ${{uniqueOnions.size}} Unique Onion Addresses`;
                 
-                // Build history sparkline (last 20 events)
-                const sparkHTML = site.history.slice(-20).map(h => 
-                    `<div class="dot" style="background:${{h.status === 'SUCCESS' ? '#fff' : '#333'}}" title="${{h.ts}}"></div>`
-                ).join('');
+                linkList.innerHTML = Array.from(uniqueOnions).map(url => {{
+                    return `<a href="${{url}}" target="_blank">${{url}}</a>`;
+                }}).join(' ');
 
-                card.innerHTML = `
-                    <div class="thumb-box">
-                        <img src="${{site.image}}" class="thumb" onerror="this.src='https://placehold.co/320x180?text=No+Preview'">
-                    </div>
-                    <div class="info">
-                        <a href="http://${{addr}}.onion" target="_blank" class="title">${{site.title}}</a>
-                        <div class="addr">${{addr}}.onion</div>
-                        
-                        <div class="actions">
-                            <a href="${{site.viz}}" class="btn-viz">
-                                <i class="fas fa-chart-line" style="margin-right:8px"></i>View Reliability Viz
-                            </a>
-                            <div class="sparkline">${{sparkHTML}}</div>
-                        </div>
-                    </div>
-                `;
-                resultsDiv.appendChild(card);
-            }});
+            }} else {{
+                resultBox.style.display = 'block';
+                resultMeta.innerText = "No mirrors discovered for this keyword";
+                linkList.innerHTML = "<center style='color:var(--dim)'>Try a broader keyword or a partial onion address string.</center>";
+            }}
         }}
     </script>
 </body>
@@ -244,13 +245,13 @@ def generate_html(data, output_file):
 """
     with open(output_file, 'w', encoding='utf-8') as f:
         f.write(html)
-    print(f"Engine built successfully -> {output_file}")
+    print(f"[SUCCESS] Mirror Discovery Engine ready: {output_file}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--log', default='../logs/unified_scraper.log')
-    parser.add_argument('--data', default='../scraped_data')
-    parser.add_argument('--output', default='../scraped_data/search_engine.html')
+    parser.add_argument('--log', default='./logs/unified_scraper.log')
+    parser.add_argument('--data', default='./scraped_data')
+    parser.add_argument('--output', default='mirror_finder.html')
     args = parser.parse_args()
     
     data = parse_full_intelligence(args.log, args.data, args.output)
