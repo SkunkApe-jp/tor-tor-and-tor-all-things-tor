@@ -144,10 +144,14 @@ def generate_global_visualization(scraped_data_dir):
     <style>
         body {{ margin: 0; overflow: hidden; background-color: #fafafa; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }}
         #tooltip {{
-            position: absolute; padding: 10px; background: white;
+            position: absolute; padding: 12px; background: white;
             border: 1px solid #ddd; border-radius: 8px; pointer-events: none;
-            opacity: 0; transition: opacity 0.2s; z-index: 100; box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+            opacity: 0; transition: opacity 0.2s; z-index: 100; box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+            max-width: 320px; min-width: 200px;
         }}
+        #tooltip img {{ max-width: 100%; max-height: 150px; width: auto; height: auto; border-radius: 4px; margin-top: 8px; display: block; }}
+        #tooltip .title {{ font-weight: bold; color: #333; margin-bottom: 4px; }}
+        #tooltip .addr {{ font-size: 11px; color: #666; }}
         .link {{ stroke: #999; stroke-opacity: 0.4; stroke-width: 1.2px; }}
         #title, #legend {{ position: absolute; background: rgba(255, 255, 255, 0.9); padding: 12px; border: 1px solid #eee; border-radius: 8px; z-index: 10; backdrop-filter: blur(4px); }}
         #title {{ top: 20px; left: 20px; font-weight: bold; font-size: 18px; }}
@@ -155,10 +159,19 @@ def generate_global_visualization(scraped_data_dir):
         #controls {{ position: absolute; top: 20px; right: 20px; z-index: 10; display: flex; flex-direction: column; gap: 8px; }}
         .control-btn {{ background: white; border: 1px solid #ccc; padding: 10px; cursor: pointer; border-radius: 6px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); transition: all 0.2s; }}
         .control-btn:hover {{ background: #f0f0f0; border-color: #999; }}
+        #searchContainer {{ position: absolute; top: 20px; right: 100px; z-index: 10; display: flex; gap: 8px; }}
+        #searchBox {{ padding: 10px 16px; border-radius: 6px; border: 1px solid #ccc; background: white; font-size: 14px; width: 200px; outline: none; }}
+        #searchBox:focus {{ border-color: #58a6ff; }}
+        #clearSearch {{ padding: 8px 12px; border-radius: 6px; border: 1px solid #ccc; background: white; cursor: pointer; font-size: 14px; }}
+        #clearSearch:hover {{ background: #f0f0f0; }}
     </style>
 </head>
 <body>
     <div id="title">Global Onion Network <span style="font-weight: normal; color: #666;">({len(nodes)} sites)</span></div>
+    <div id="searchContainer">
+        <input type="text" id="searchBox" placeholder="🔍 Search sites...">
+        <button id="clearSearch">✕</button>
+    </div>
     <div id="controls">
         <button class="control-btn" onclick="zoomIn()" title="Zoom In"><b>+</b></button>
         <button class="control-btn" onclick="zoomOut()" title="Zoom Out"><b>−</b></button>
@@ -231,23 +244,92 @@ def generate_global_visualization(scraped_data_dir):
             .join("g")
             .attr("cursor", "move")
             .on("click", (e, d) => d.image && window.open(d.image, '_blank'))
+            .on("mouseover", (event, d) => {{
+                const tooltip = d3.select("#tooltip");
+                let html = '<div class="title">' + d.title + '</div><div class="addr">' + d.id + '.onion</div>';
+                if (d.image) {{
+                    html += '<img src="' + d.image + '" alt="screenshot" onerror="this.style.display=' + "'none'" + '"/>';
+                }}
+                tooltip.html(html)
+                    .style("left", (event.pageX + 15) + "px")
+                    .style("top", (event.pageY + 15) + "px")
+                    .style("opacity", 1);
+            }})
+            .on("mousemove", (event) => {{
+                d3.select("#tooltip")
+                    .style("left", (event.pageX + 15) + "px")
+                    .style("top", (event.pageY + 15) + "px");
+            }})
+            .on("mouseout", () => {{
+                d3.select("#tooltip").style("opacity", 0);
+            }})
             .call(d3.drag()
                 .on("start", dragstarted)
                 .on("drag", dragged)
                 .on("end", dragended));
 
+        // Search functionality
+        const searchBox = document.getElementById('searchBox');
+        const clearSearch = document.getElementById('clearSearch');
+        
+        function performSearch() {{
+            const query = searchBox.value.toLowerCase().trim();
+            
+            if (!query) {{
+                node.selectAll("circle, image").style("opacity", 1);
+                link.style("opacity", 1);
+                label.style("opacity", 1);
+                return;
+            }}
+            
+            node.each(function(d) {{
+                const matches = d.title && d.title.toLowerCase().includes(query);
+                const matchesId = d.id && d.id.toLowerCase().includes(query);
+                const matchesName = d.name && d.name.toLowerCase().includes(query);
+                
+                if (matches || matchesId || matchesName) {{
+                    d3.select(this).selectAll("circle, image").style("opacity", 1);
+                }} else {{
+                    d3.select(this).selectAll("circle, image").style("opacity", 0.2);
+                }}
+            }});
+            
+            // Also dim labels and links for non-matches
+            label.style("opacity", d => {{
+                const matches = d.title && d.title.toLowerCase().includes(query);
+                const matchesId = d.id && d.id.toLowerCase().includes(query);
+                const matchesName = d.name && d.name.toLowerCase().includes(query);
+                return (matches || matchesId || matchesName) ? 1 : 0.2;
+            }});
+            
+            link.style("opacity", d => {{
+                const sourceMatches = d.source.title && d.source.title.toLowerCase().includes(query);
+                const sourceIdMatches = d.source.id && d.source.id.toLowerCase().includes(query);
+                const targetMatches = d.target.title && d.target.title.toLowerCase().includes(query);
+                const targetIdMatches = d.target.id && d.target.id.toLowerCase().includes(query);
+                return (sourceMatches || sourceIdMatches || targetMatches || targetIdMatches) ? 0.6 : 0.1;
+            }});
+        }}
+        
+        searchBox.addEventListener('input', performSearch);
+        clearSearch.addEventListener('click', () => {{
+            searchBox.value = '';
+            performSearch();
+            searchBox.focus();
+        }});
+
         // Images for screenshot nodes
         node.filter(d => d.image)
             .append("circle")
-            .attr("r", 40)
+            .attr("r", 20)
             .attr("fill", "#fff")
             .attr("stroke", "#ddd");
 
         node.filter(d => d.image)
             .append("image")
             .attr("xlink:href", d => d.image)
-            .attr("x", -40).attr("y", -40).attr("width", 80).attr("height", 80)
-            .attr("clip-path", "circle(38px at 40px 40px)");
+            .attr("x", -20).attr("y", -20).attr("width", 40).attr("height", 40)
+            .attr("clip-path", "circle(18px at 20px 20px)");
 
         // Circles for text-only nodes
         node.filter(d => !d.image)
