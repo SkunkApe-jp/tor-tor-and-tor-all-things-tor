@@ -126,24 +126,6 @@ func main() {
 		fmt.Printf("[CONFIG] Intra-page delay: %d sec\n", optIntraPageDelay)
 	}
 
-	pw, err := playwright.Run()
-	if err != nil {
-		log.Fatalf("could not start playwright: %v", err)
-	}
-	defer pw.Stop()
-
-	browser, err := pw.Firefox.Launch(playwright.BrowserTypeLaunchOptions{
-		Headless: playwright.Bool(true),
-		Proxy: &playwright.Proxy{
-			Server: TorProxyServer,
-		},
-		Args: []string{"--proxy-remote-dns"},
-	})
-	if err != nil {
-		log.Fatalf("could not launch firefox: %v", err)
-	}
-	defer browser.Close()
-
 	targets, err := readTargets(optTargetsFile)
 	if err != nil {
 		log.Fatalf("could not read targets: %v", err)
@@ -161,7 +143,7 @@ func main() {
 
 	for i := 1; i <= workers; i++ {
 		wg.Add(1)
-		go worker(i, browser, jobs, &wg)
+		go worker(i, jobs, &wg)
 	}
 
 	for _, u := range targets {
@@ -173,8 +155,28 @@ func main() {
 	fmt.Println("\n[DONE] All targets processed!")
 }
 
-func worker(id int, browser playwright.Browser, jobs <-chan string, wg *sync.WaitGroup) {
+func worker(id int, jobs <-chan string, wg *sync.WaitGroup) {
 	defer wg.Done()
+
+	pw, err := playwright.Run()
+	if err != nil {
+		fmt.Printf("[THREAD %d] Could not start playwright: %v\n", id, err)
+		return
+	}
+	defer pw.Stop()
+
+	browser, err := pw.Firefox.Launch(playwright.BrowserTypeLaunchOptions{
+		Headless: playwright.Bool(true),
+		Proxy: &playwright.Proxy{
+			Server: TorProxyServer,
+		},
+		Args: []string{"--proxy-remote-dns"},
+	})
+	if err != nil {
+		fmt.Printf("[THREAD %d] Could not launch firefox: %v\n", id, err)
+		return
+	}
+	defer browser.Close()
 
 	for targetURL := range jobs {
 		// Inter-site delay with Gaussian distribution (human-like)
