@@ -1,45 +1,66 @@
-# Unified Scraper - Epoch Automation
+# Onion Recon & Archiving Suite v2.1
 
-This README explains how to automate your scraper using Windows Task Scheduler.
+A professional-grade toolkit for large-scale onion discovery and high-fidelity site archiving.
 
-## Quick Start
+---
 
-### Prerequisites
-- Tor Browser or Tor Expert Bundle running (port 9050)
-- Python and required packages installed
-- `split_output` folder with target files
+## 🧅 1. Unified Scraper (Go + Playwright)
+Located in: `go_scripts/playwright/unified_scraper.go`
 
-### Automated Daily Runs
+A heavyweight, high-fidelity archiver that renders sites exactly like the Tor Browser.
 
-Use `automate_scraper.ps1` to update targets and run the scraper:
+### 🚀 Key Features
+- **Full Rendering:** Handles JavaScript-only sites, markets, and forums.
+- **Visual Evidence:** Automatic full-page screenshots.
+- **Site Mirroring:** Recreates the site structure locally (`saved_site`) for offline browsing.
 
+### 🆕 New "God-Tier" Upgrades:
+- **Stateful Resuming (`-resume`):** Automatically reads `unified_scraper.log`. If it sees an onion was already successful, it skips it.
+- **Recursive Crawling (`-depth X`):** Set `-depth 2` to automatically follow and archive all internal links on a page.
+- **Parallel Asset Fetching:** Downloads images and styles up to 10x faster using a concurrent worker pool.
+- **Windows MAX_PATH Fix:** Uses shared `_assets/` folders and UNC (`\\?\`) prefixing to bypass the 260-character folder limit.
+- **Fast Mode (`-fast`):** Reduces "stealth" delays from 15 minutes down to 10 seconds for easier debugging.
+
+### 🛠️ How to Run:
 ```powershell
-python "c:\scraper1\verymoist\moist.py"
-& "c:\scraper1\bin\unified_scraper.exe" -targets "c:\scraper1\targets.yaml" -workers 40 -screenshot=true -links=true -titles=true -html=true
+# Fast, shallow run (Single page)
+go run .\go_scripts\playwright\unified_scraper.go -fast -targets targets.yaml
+
+# Deep, stateful archive (Crawl all internal links)
+go run .\go_scripts\playwright\unified_scraper.go -depth 2 -resume
 ```
 
-## Task Scheduler Setup
+---
 
-### GUI Method
-1. Press `Win + R`, type `taskschd.msc`, press Enter
-2. Click **Create Basic Task...**
-3. Name: `Unified Scraper - Epoch Run`
-4. Trigger: **Daily** at your preferred time (e.g., 2:00 AM)
-5. Action: **Start a program**
-   - Program: `powershell.exe`
-   - Arguments: `-ExecutionPolicy Bypass -File "c:\scraper1\automate_scraper.ps1"`
-   - Start in: `c:\scraper1`
+## ⚡ 2. Fast Async Scrubber (Python + Httpx)
+Located in: `fast_onion_scrubber.py`
 
-### Command Line Method
+A lightweight "Scout" engine designed to check thousands of links in seconds.
+
+### 🚀 Key Features
+- **Asyncio Engine:** Rewritten for massive throughput using non-blocking I/O.
+- **Low Footprint:** No browser needed—just raw HTTP requests.
+
+### 🆕 New "God-Tier" Upgrades:
+- **SQLite3 Integration:** Automatically stores results in a persistent database (`onion_results.db`). Perfect for building historical records.
+- **Batch Proxying (`--ports`):** Rotate through multiple Tor instances (e.g., ports 9050, 9051) in round-robin fashion to bypass congestion and rate-limits.
+- **Database Resuming (`--resume`):** Skips any URL that is already marked as "Status 200" in your SQLite database.
+
+### 🛠️ How to Run:
 ```powershell
-$Action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-ExecutionPolicy Bypass -File "c:\scraper1\automate_scraper.ps1"' -WorkingDirectory 'c:\scraper1'
-$Trigger = New-ScheduledTaskTrigger -DailyAt '2am'
-Register-ScheduledTask -Action $Action -Trigger $Trigger -TaskName "UnifiedScraperEpoch" -Description "Daily scraper run following targets epoch"
+# Basic run with resume
+python .\fast_onion_scrubber.py --input targets.txt --resume
+
+# High-performance Batch Proxying (Load-balance across 3 Tor instances)
+python .\fast_onion_scrubber.py --input targets.txt --concurrency 50 --ports 9050,9051,9052
 ```
 
-## Key Notes
+---
 
-- **Tor Connection**: The scraper requires Tor on port 9050. Without it, the scraper will abort with `NOT CONNECTED TO TOR!`
-- **Epoch**: `moist.py` defaults Day 0 to `2026-02-20`. Change this in `verymoist/moist.py` if needed
-- **Stealth Delays**: Default 8-15 min between sites. With 40 workers and 10,000 targets, expect ~40 hours to complete
-- **Speed Up**: Add `-inter-delay 1` (minutes) to reduce delays (increases blocking risk)
+## 📦 Requirements & Installation
+- **Go Scraper:** `go get github.com/playwright-community/playwright-go`
+- **Python Scrubber:** `pip install aiosqlite httpx[socks] socksio`
+- **Tor:** A running Tor instance on port 9050 (and extra ports if using batch proxying).
+
+---
+*Created with 🧅 by Antigravity AI*
