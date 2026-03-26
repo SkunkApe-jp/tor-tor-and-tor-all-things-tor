@@ -47,6 +47,9 @@ var (
 	optInterSiteDelay int  // Inter-site delay in minutes (default: 8-15 Gaussian)
 	optIntraPageDelay int  // Intra-page "reading" delay in seconds (default: 60-120)
 	optWorkerCount    int  // Number of parallel workers
+	optFastMode       bool // Fast mode: reduce all stealth delays (inter-site to 5-15s, intra-page to 5-10s)
+	optDepth          int  // Scrape depth (default 1)
+	optResume         bool // Resume from log (skip already successful onions)
 )
 
 
@@ -77,9 +80,11 @@ func init() {
 	flag.IntVar(&optIntraPageDelay, "intra-delay", 0, "Intra-page reading delay: 0=60-120sec, or set custom (sec)")
 	flag.IntVar(&optWorkerCount, "workers", 1, "Number of parallel workers (default: 1)")
 	flag.BoolVar(&optFastMode, "fast", false, "Fast mode: reduce all stealth delays (inter-site to 5-15s, intra-page to 5-10s)")
+	flag.IntVar(&optDepth, "depth", 1, "Scrape depth (default 1 = single page, 2 = all links on page, etc.)")
+	flag.BoolVar(&optResume, "resume", true, "Resume from processed_targets.log (default: true)")
 }
 
-var optFastMode bool
+
 
 func main() {
 	flag.Parse()
@@ -144,25 +149,68 @@ func main() {
 
 	fmt.Printf("[INFO] Loaded %d targets\n", len(targets))
 
-	jobs := make(chan string, len(targets))
-	var wg sync.WaitGroup
+	// Resuming logic: Read already processed sites from log
+	processedOnions := make(map[string]bool)
+	if optResume {
+		if file, err := os.Open(optLogFile); err == nil {
+			scanner := bufio.NewScanner(file)
+			for scanner.Scan() {
+				line := scanner.Text()
+				if strings.Contains(line, "Status: SUCCESS") {
+					onion := extractOnionAddress(line)
+					if onion != "unknown" {
+						processedOnions[onion] = true
+					}
+				}
+			}
+			file.Close()
+			if len(processedOnions) > 0 {
+				fmt.Printf("[RESUME] Skipping %d already processed onion identities\n", len(processedOnions))
+			}
+		}
+	}
+
+	jobQueue := make(chan ScrapingJob, 5000)
+	var workerWg sync.WaitGroup // tracks worker lifecycle
+	var taskWg sync.WaitGroup   // tracks individual scraping tasks
 
 	for i := 1; i <= workers; i++ {
-		wg.Add(1)
-		go worker(i, jobs, &wg)
+		workerWg.Add(1)
+		go worker(i, jobQueue, &workerWg, &taskWg)
 	}
 
 	for _, u := range targets {
-		jobs <- u
+		onion := extractOnionAddress(u)
+		if optResume && processedOnions[onion] {
+			continue
+		}
+		taskWg.Add(1)
+		jobQueue <- ScrapingJob{URL: u, Depth: 1}
 	}
-	close(jobs)
-	wg.Wait()
+
+	// Dynamic wait: Close jobQueue only when all tasks (including discovered ones) are done
+	go func() {
+		taskWg.Wait()
+		close(jobQueue)
+	}()
+
+	workerWg.Wait()
 
 	fmt.Println("\n[DONE] All targets processed!")
 }
 
-func worker(id int, jobs <-chan string, wg *sync.WaitGroup) {
-	defer wg.Done()
+type ScrapingJob struct {
+	URL   string
+	Depth int
+}
+
+var (
+	seenURLs   = make(map[string]bool)
+	seenMu     sync.Mutex
+)
+
+func worker(id int, jobs chan ScrapingJob, workerWg *sync.WaitGroup, taskWg *sync.WaitGroup) {
+	defer workerWg.Done()
 
 	pw, err := playwright.Run()
 	if err != nil {
@@ -184,10 +232,23 @@ func worker(id int, jobs <-chan string, wg *sync.WaitGroup) {
 	}
 	defer browser.Close()
 
-	for targetURL := range jobs {
+	for job := range jobs {
+		targetURL := job.URL
+		currentDepth := job.Depth
+
+		// Global seen check to avoid loops
+		seenMu.Lock()
+		if seenURLs[targetURL] {
+			seenMu.Unlock()
+			taskWg.Done()
+			continue
+		}
+		seenURLs[targetURL] = true
+		seenMu.Unlock()
+
 		// Inter-site delay with Gaussian distribution (human-like)
 		delay := getInterSiteDelay()
-		fmt.Printf("\n[THREAD %d] Waiting %v for %s\n", id, delay, targetURL)
+		fmt.Printf("\n[THREAD %d] (Depth %d) Waiting %v for %s\n", id, currentDepth, delay, targetURL)
 		time.Sleep(delay)
 
 		data, err := processURL(browser, targetURL)
@@ -198,6 +259,35 @@ func worker(id int, jobs <-chan string, wg *sync.WaitGroup) {
 		}
 
 		onionAddr := extractOnionAddress(targetURL)
+
+		// -------------------------------------------------------------
+		// Handle Depth Discovery (Crawl within site)
+		// -------------------------------------------------------------
+		if currentDepth < optDepth && len(data.links) > 0 {
+			targetParsed, _ := url.Parse(targetURL)
+			added := 0
+			for _, link := range data.links {
+				linkParsed, err := url.Parse(link)
+				if err != nil { continue }
+				
+				// Only crawl links on the same onion hostname to avoid leaving the target
+				if linkParsed.Host == targetParsed.Host && linkParsed.Host != "" {
+					seenMu.Lock()
+					alreadySeen := seenURLs[link]
+					if !alreadySeen {
+						added++
+						taskWg.Add(1)
+						go func(l string, d int) {
+							jobs <- ScrapingJob{URL: l, Depth: d}
+						}(link, currentDepth+1)
+					}
+					seenMu.Unlock()
+				}
+			}
+			if added > 0 {
+				fmt.Printf("[CRAWL] Discovered %d new internal links on %s (New jobs queued)\n", added, onionAddr)
+			}
+		}
 
 		// Save screenshot
 		if optScreenshot && len(data.screenshot) > 0 {
@@ -255,6 +345,7 @@ func worker(id int, jobs <-chan string, wg *sync.WaitGroup) {
 
 		logMsg := formatResults(data)
 		appendLog(targetURL, "SUCCESS", logMsg, data)
+		taskWg.Done()
 	}
 }
 
