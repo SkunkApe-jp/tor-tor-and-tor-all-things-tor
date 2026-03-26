@@ -122,6 +122,14 @@
             padding: 2px 8px; border-radius: 2px; border: 1px dotted var(--dim);
         }
 
+        .btn-del {
+            background: transparent; color: var(--dim); border: none; 
+            cursor: pointer; padding: 4px; border-radius: 50%;
+            transition: 0.2s; font-size: 0.9rem; margin-left: 5px;
+        }
+
+        .btn-del:hover { color: var(--delete); transform: scale(1.1); }
+
         /* Meta header with Buttons */
         .meta-header {
             display: flex; justify-content: space-between; align-items: center;
@@ -282,6 +290,7 @@
                         <div class="onion-node" id="node-${addr}">
                             <a href="${o.url}" target="_blank">${o.url}</a>
                             ${statsHtml}
+                            <button class="btn-del" title="Delete Individual Target" onclick="deleteNode('${addr}', this)"><i class="fas fa-times"></i></button>
                         </div>
                     `;
                 });
@@ -293,6 +302,22 @@
                 metaZero.innerText = "No mirrors detected";
                 lp.innerHTML = "<span style='color:var(--dim)'>Try a different identity title.</span>";
                 imgGrid.innerHTML = "";
+            }
+        }
+
+        async function deleteNode(address, btnElement) {
+            if(!confirm(`Are you sure you want to permanently delete the scraped data for ${address}?`)) return;
+            try {
+                const baseUrl = window.location.protocol === "file:" ? "http://localhost:8989" : "";
+                const response = await fetch(`${baseUrl}/api/delete/${address}`, { method: 'POST' });
+                if (response.ok) {
+                    const nodeEl = document.getElementById(`node-${address}`);
+                    if (nodeEl) nodeEl.remove();
+                } else {
+                    alert("Delete failed. Make sure the API server is running.");
+                }
+            } catch (e) {
+                alert("Delete blocked! Ensure the Python Engine is running on port 8989.");
             }
         }
 

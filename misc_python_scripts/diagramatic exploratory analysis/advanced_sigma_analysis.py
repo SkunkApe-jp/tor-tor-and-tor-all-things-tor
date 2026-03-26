@@ -180,8 +180,8 @@ def generate_advanced_viz(scraped_data_dir, mock=False):
 <html>
 <head>
     <title>Advanced Network Analysis (Sigma.js + WebGL)</title>
-    <script src="https://cdn.jsdelivr.net/npm/graphology@0.25.1/dist/graphology.min.js"></script>
-    <script src="https://unpkg.com/sigma@2.4.0/build/sigma.min.js"></script>
+    <script src="../../../graphology.min.js"></script>
+    <script src="../../../sigma.min.js"></script>
     <style>
         body, #container {{ width: 100vw; height: 100vh; margin: 0; background: #0b0e14; color: #fff; font-family: sans-serif; overflow: hidden; }}
         #ui {{ position: absolute; top: 20px; left: 20px; z-index: 10; background: rgba(13, 17, 23, 0.9); padding: 20px; border-radius: 12px; border: 1px solid #30363d; box-shadow: 0 8px 32px rgba(0,0,0,0.5); backdrop-filter: blur(8px); }}

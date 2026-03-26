@@ -97,7 +97,7 @@ def generate_cosmograph_viz(scraped_data_dir):
 <head>
     <title>Cosmograph Massive Onion Network Explorer</title>
     <!-- Use the latest stable v2 UMD build -->
-    <script src="https://cdn.jsdelivr.net/npm/@cosmograph/cosmograph@2/dist/index.min.js"></script>
+    <script src="../../../cosmograph.min.js"></script>
     <style>
         body, html {{ margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #050505; color: #fff; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }}
         #container {{ width: 100vw; height: 100vh; }}

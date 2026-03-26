@@ -109,7 +109,7 @@ def generate_echarts_viz(scraped_data_dir):
 <html>
 <head>
     <title>ECharts Onion Network</title>
-    <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
+    <script src="../../../echarts.min.js"></script>
     <style>
         body, #main {{ width: 100vw; height: 100vh; margin: 0; background: #100c2a; overflow: hidden; }}
         #ui {{ position: absolute; top: 20px; left: 20px; z-index: 10; color: #fff; pointer-events: none; }}

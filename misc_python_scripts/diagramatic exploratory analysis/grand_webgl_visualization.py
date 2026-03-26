@@ -86,39 +86,43 @@ def generate_grand_webgl_viz(scraped_data_dir):
         })
         processed_urls.add(root_id)
 
-        # Get all linked onions
+        # Get all linked onions - limit to prevent explosion
         connected_links = set()
+        max_links_per_site = 50  # Limit links per site to prevent too many edges
+        
         for d in ['discovered_links', 'urls']:
             d_path = os.path.join(site_dir, d)
             if os.path.exists(d_path):
                 for f in os.listdir(d_path):
-                    if f.endswith('_links.txt'):
+                    if f.endswith('_links.txt') and len(connected_links) < max_links_per_site:
                         with open(os.path.join(d_path, f), 'r', encoding='utf-8') as file:
                             for line in file:
+                                if len(connected_links) >= max_links_per_site:
+                                    break
                                 line = line.strip()
-                                if line: connected_links.add(line)
+                                # Only match actual onion URLs
+                                onion_match = re.search(r'([a-z2-7]{16,56}\.onion)', line)
+                                if onion_match:
+                                    connected_links.add(onion_match.group(1))
 
         # Add links as child nodes
         for link in connected_links:
-            onion_match = re.search(r'([a-z2-7]{16,56}\.onion)', link)
-            if onion_match:
-                target_onion = onion_match.group(1)
-                child_id = f"child_{link}"
-                
-                if child_id not in processed_urls:
-                    nodes.append({
-                        "id": child_id,
-                        "name": link,
-                        "val": 5,
-                        "group": addr,
-                        "isRoot": False
-                    })
-                    processed_urls.add(child_id)
-                
-                links.append({
-                    "source": root_id,
-                    "target": child_id
+            child_id = f"child_{link}"
+            
+            if child_id not in processed_urls:
+                nodes.append({
+                    "id": child_id,
+                    "name": link,
+                    "val": 5,
+                    "group": addr,
+                    "isRoot": False
                 })
+                processed_urls.add(child_id)
+            
+            links.append({
+                "source": root_id,
+                "target": child_id
+            })
 
     graph_data = {"nodes": nodes, "links": links}
 
@@ -126,16 +130,31 @@ def generate_grand_webgl_viz(scraped_data_dir):
 <html>
 <head>
     <title>Grand Deep Web Explorer (WebGL)</title>
-    <script src="https://unpkg.com/force-graph"></script>
+    <script src="../../../force-graph.min.js"></script>
     <style>
         body {{ margin: 0; background: #00050a; color: #eee; font-family: 'Segoe UI', sans-serif; overflow: hidden; }}
         #title {{ position: absolute; top: 20px; left: 20px; z-index: 10; font-size: 20px; font-weight: 300; background: rgba(0,20,40,0.7); padding: 12px 25px; border-radius: 8px; border-left: 5px solid #00d2ff; backdrop-filter: blur(10px); }}
         #graph {{ width: 100vw; height: 100vh; }}
         #ui-overlay {{ position: absolute; bottom: 20px; left: 20px; background: rgba(0,10,20,0.6); padding: 15px; border-radius: 6px; font-size: 13px; z-index: 10; border: 1px solid #103050; }}
+        #tooltip {{ position: absolute; padding: 12px; background: rgba(0,10,20,0.95); border: 1px solid #00d2ff; border-radius: 8px; pointer-events: none; opacity: 0; transition: opacity 0.2s; z-index: 100; max-width: 320px; }}
+        #tooltip img {{ max-width: 100%; max-height: 150px; width: auto; height: auto; border-radius: 4px; margin-top: 8px; display: block; }}
+        #tooltip .name {{ font-weight: bold; color: #00d2ff; margin-bottom: 4px; }}
+        #tooltip .addr {{ font-size: 11px; color: #aaa; }}
+        #searchContainer {{ position: absolute; top: 20px; right: 20px; z-index: 10; display: flex; gap: 8px; }}
+        #searchBox {{ padding: 10px 16px; border-radius: 6px; border: 1px solid #103050; background: rgba(0,20,40,0.8); color: #fff; font-size: 14px; width: 200px; outline: none; }}
+        #searchBox:focus {{ border-color: #00d2ff; }}
+        #searchBox::placeholder {{ color: #666; }}
+        #clearSearch {{ padding: 8px 12px; border-radius: 6px; border: 1px solid #103050; background: rgba(0,20,40,0.8); color: #fff; cursor: pointer; font-size: 14px; }}
+        #clearSearch:hover {{ background: rgba(0,80,120,0.8); }}
     </style>
 </head>
 <body>
     <div id="title">Grand Network Explorer <span style="font-size: 14px; opacity: 0.6;">({len(nodes)} nodes, {len(links)} edges)</span></div>
+    <div id="searchContainer">
+        <input type="text" id="searchBox" placeholder="🔍 Search nodes...">
+        <button id="clearSearch">✕</button>
+    </div>
+    <div id="tooltip"></div>
     <div id="ui-overlay">
         <b>Groups:</b> Nodes colored by root onion site<br/>
         <b>Interaction:</b> Click to expand, Scroll to zoom, Drag to move
@@ -189,6 +208,70 @@ def generate_grand_webgl_viz(scraped_data_dir):
         // Adjust forces for better grand distribution
         Graph.d3Force('charge').strength(-150);
         Graph.d3Force('link').distance(80);
+
+        // Search functionality
+        const searchBox = document.getElementById('searchBox');
+        const clearSearch = document.getElementById('clearSearch');
+        const tooltip = document.getElementById('tooltip');
+        
+        function performSearch() {{
+            const query = searchBox.value.toLowerCase().trim();
+            
+            if (!query) {{
+                Graph.nodeColor(node => node.color || '#00d2ff');
+                Graph.linkColor(link => 'rgba(0, 210, 255, 0.15)');
+                Graph.nodeRelSize(1);
+                return;
+            }}
+            
+            Graph.nodeColor(node => {{
+                const matches = node.name && node.name.toLowerCase().includes(query);
+                const matchesId = node.id && node.id.toLowerCase().includes(query);
+                return (matches || matchesId) ? '#d5ff16' : 'rgba(0, 210, 255, 0.15)';
+            }});
+            
+            Graph.linkColor(link => {{
+                const srcMatch = link.source.name && link.source.name.toLowerCase().includes(query);
+                const tgtMatch = link.target.name && link.target.name.toLowerCase().includes(query);
+                return (srcMatch || tgtMatch) ? 'rgba(213, 255, 22, 0.4)' : 'rgba(0, 210, 255, 0.05)';
+            }});
+            
+            Graph.nodeRelSize(node => {{
+                const matches = node.name && node.name.toLowerCase().includes(query);
+                const matchesId = node.id && node.id.toLowerCase().includes(query);
+                return (matches || matchesId) ? 3 : 0.5;
+            }});
+        }}
+        
+        searchBox.addEventListener('input', performSearch);
+        clearSearch.addEventListener('click', () => {{
+            searchBox.value = '';
+            performSearch();
+            searchBox.focus();
+        }});
+        
+        // Tooltip functionality
+        Graph.onNodeHover(node => {{
+            if (node) {{
+                let html = '<div class="name">' + node.name + '</div><div class="addr">' + node.id + '</div>';
+                // Show image if it's a root node with screenshot
+                if (node.isRoot) {{
+                    const addr = node.id.replace('root_', '');
+                    html += '<img src="' + addr + '/images/index.png" alt="screenshot" onerror="this.style.display=' + "'none'" + '"/>';
+                }}
+                tooltip.innerHTML = html;
+                tooltip.style.opacity = 1;
+            }} else {{
+                tooltip.style.opacity = 0;
+            }}
+        }});
+        
+        Graph.onNodeClick(node => {{
+            if (node && node.isRoot) {{
+                const addr = node.id.replace('root_', '');
+                window.open(addr + '/images/index.png', '_blank');
+            }}
+        }});
     </script>
 </body>
 </html>"""

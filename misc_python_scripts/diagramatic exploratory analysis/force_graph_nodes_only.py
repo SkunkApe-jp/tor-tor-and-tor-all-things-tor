@@ -28,8 +28,8 @@ def extract_title_from_identity(identity_dir):
             if file_name.endswith('_title.txt'):
                 try:
                     with open(os.path.join(identity_dir, file_name), 'r', encoding='utf-8') as f:
-                        line = f.readline()
-                        match = re.search(r'\[(.*?)\] ->', line)
+                        content = f.read()
+                        match = re.search(r'\[(.*?)\]', content)
                         if match:
                             return match.group(1).strip()
                 except: pass

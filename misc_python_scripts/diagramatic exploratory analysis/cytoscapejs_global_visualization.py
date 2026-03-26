@@ -141,7 +141,7 @@ def generate_global_visualization(scraped_data_dir):
 <html>
 <head>
     <title>Global Onion Network (Cytoscape)</title>
-    <script src="https://unpkg.com/cytoscape/dist/cytoscape.min.js"></script>
+    <script src="../../../cytoscape.min.js"></script>
     <style>
         body {{ margin: 0; overflow: hidden; background-color: #1a1a1a; font-family: 'Segoe UI', sans-serif; color: #eee; }}
         #cy {{ width: 100vw; height: 100vh; display: block; }}
