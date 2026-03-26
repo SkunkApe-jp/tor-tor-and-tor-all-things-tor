@@ -463,13 +463,10 @@ def generate_discovery_portal(groups):
             currentMatches.forEach(group => {{
                 // Replace invalid title characters
                 const safeTitle = group.title.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-                html += `    <DT><H3 ADD_DATE="${{ts}}" LAST_MODIFIED="${{ts}}">${{safeTitle}}</H3>\\n`;
-                html += `    <DL><p>\\n`;
                 
                 group.onions.forEach(onion => {{
-                    html += `        <DT><A HREF="${{onion.url}}" ADD_DATE="${{ts}}">${{onion.url}}</A>\\n`;
+                    html += `    <DT><A HREF="${{onion.url}}" ADD_DATE="${{ts}}">${{safeTitle}}</A>\\n`;
                 }});
-                html += `    </DL><p>\\n`;
             }});
 
             html += `</DL><p>\\n`;
