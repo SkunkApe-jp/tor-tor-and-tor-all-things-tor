@@ -2,6 +2,8 @@ package main
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"io"
@@ -13,6 +15,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -73,7 +76,10 @@ func init() {
 	flag.IntVar(&optInterSiteDelay, "inter-delay", 0, "Inter-site delay: 0=Gaussian 8-15min, or set custom mean (min)")
 	flag.IntVar(&optIntraPageDelay, "intra-delay", 0, "Intra-page reading delay: 0=60-120sec, or set custom (sec)")
 	flag.IntVar(&optWorkerCount, "workers", 1, "Number of parallel workers (default: 1)")
+	flag.BoolVar(&optFastMode, "fast", false, "Fast mode: reduce all stealth delays (inter-site to 5-15s, intra-page to 5-10s)")
 }
+
+var optFastMode bool
 
 func main() {
 	flag.Parse()
@@ -354,8 +360,7 @@ func processURL(browser playwright.Browser, fullURL string) (*ScrapedData, error
 				data.htmlContent = html
 			}
 			if optSaveSite {
-				// --- PROACTIVE ASSET DISCOVERY ---
-				// Find anything the browser missed (favicons, opensearch xmls, etc.)
+				// --- PROACTIVE ASSET DISCOVERY (Parallelized) ---
 				extensions := "png|jpg|jpeg|gif|ico|svg|css|xml|json|woff2?|ttf|otf|bin|pdf"
 				if optAllowJS {
 					extensions += "|js"
@@ -364,49 +369,81 @@ func processURL(browser playwright.Browser, fullURL string) (*ScrapedData, error
 				potentialAssets := assetRegex.FindAllStringSubmatch(html, -1)
 				
 				baseURLParsed, _ := url.Parse(fullURL)
-				for _, match := range potentialAssets {
-					if len(match) < 2 { continue }
-					assetPath := match[1]
-					
-					// Resolve to absolute URL
-					assetURLObj, err := baseURLParsed.Parse(assetPath)
-					if err != nil { continue }
-					assetURL := assetURLObj.String()
-					
-					// Skip data URIs or already captured ones
-					if strings.HasPrefix(assetURL, "data:") { continue }
+				
+				// Use a worker pool for assets to speed up deep pages
+				assetJobs := make(chan string, len(potentialAssets))
+				assetWg := sync.WaitGroup{}
+				assetWorkers := 5
+				if optFastMode { assetWorkers = 10 }
 
-					resMu.Lock()
-					_, alreadyCaptured := capturedResources[assetURL]
-					resMu.Unlock()
-					
-					if !alreadyCaptured && (assetURLObj.Host == baseURLParsed.Host || assetURLObj.Host == "") {
-						// Small artificial delay to avoid hammering the SOCKS proxy too fast
-						time.Sleep(100 * time.Millisecond)
-						
-						// Use browser evaluation to fetch the resource (keeps cookies/headers/proxy)
-						fetchScript := fmt.Sprintf(`fetch("%s").then(r => r.arrayBuffer()).then(b => Array.from(new Uint8Array(b))).catch(e => null)`, assetURL)
-						if rawArr, err := page.Evaluate(fetchScript); err == nil && rawArr != nil {
-							if resSlice, ok := rawArr.([]interface{}); ok {
-								body := make([]byte, len(resSlice))
-								for i, v := range resSlice {
-									// Handle both float64 and int types returned by the browser
-									switch val := v.(type) {
-									case float64:
-										body[i] = byte(val)
-									case int:
-										body[i] = byte(val)
-									case int64:
-										body[i] = byte(val)
+				var completedMu sync.Mutex
+				completedCount := 0
+				totalCount := len(potentialAssets)
+
+				for i := 0; i < assetWorkers; i++ {
+					assetWg.Add(1)
+					go func() {
+						defer assetWg.Done()
+						for assetPath := range assetJobs {
+							assetURLObj, err := baseURLParsed.Parse(assetPath)
+							if err != nil { 
+								completedMu.Lock()
+								completedCount++
+								printProgress(completedCount, totalCount)
+								completedMu.Unlock()
+								continue 
+							}
+							assetURL := assetURLObj.String()
+							
+							if strings.HasPrefix(assetURL, "data:") { 
+								completedMu.Lock()
+								completedCount++
+								printProgress(completedCount, totalCount)
+								completedMu.Unlock()
+								continue 
+							}
+
+							resMu.Lock()
+							_, alreadyCaptured := capturedResources[assetURL]
+							resMu.Unlock()
+							
+							if !alreadyCaptured && (assetURLObj.Host == baseURLParsed.Host || assetURLObj.Host == "") {
+								time.Sleep(100 * time.Millisecond) // Protective delay
+								
+								// Use browser evaluation to fetch the resource
+								fetchScript := fmt.Sprintf(`fetch("%s").then(r => r.arrayBuffer()).then(b => Array.from(new Uint8Array(b))).catch(e => null)`, assetURL)
+								if rawArr, err := page.Evaluate(fetchScript); err == nil && rawArr != nil {
+									if resSlice, ok := rawArr.([]interface{}); ok {
+										body := make([]byte, len(resSlice))
+										for i, v := range resSlice {
+											switch val := v.(type) {
+											case float64: body[i] = byte(val)
+											case int:     body[i] = byte(val)
+											case int64:   body[i] = byte(val)
+											}
+										}
+										resMu.Lock()
+										capturedResources[assetURL] = body
+										resMu.Unlock()
 									}
 								}
-								resMu.Lock()
-								capturedResources[assetURL] = body
-								resMu.Unlock()
 							}
+							completedMu.Lock()
+							completedCount++
+							printProgress(completedCount, totalCount)
+							completedMu.Unlock()
 						}
+					}()
+				}
+
+				for _, match := range potentialAssets {
+					if len(match) >= 2 {
+						assetJobs <- match[1]
 					}
 				}
+				close(assetJobs)
+				assetWg.Wait()
+				fmt.Println("\n[ASSETS] Completed discovery and processing.")
 				// --- END PROACTIVE ASSET DISCOVERY ---
 
 				// Build filename map and rewrite HTML
@@ -416,7 +453,6 @@ func processURL(browser playwright.Browser, fullURL string) (*ScrapedData, error
 					local := resourceRelativePath(resURL)
 					data.siteFilenames[resURL] = local
 				}
-				// Add the page itself to the map so links to it stay local
 				data.siteFilenames[fullURL] = "index.html"
 				
 				data.siteHTML = rewriteHTML(html, fullURL, data.siteFilenames)
@@ -522,9 +558,15 @@ func rewriteHTML(html string, baseURL string, filenameMap map[string]string) str
 	var replaces []string
 
 	for origURL, localName := range filenameMap {
-		localRef := localName // NO "_files/" - preservation of directory structure
+		// Assets are saved in a shared folder, so we must adjust the relative path
+		localRef := localName
 		if localName == "index.html" {
 			localRef = "index.html"
+		} else {
+			// All pages are saved in saved_site/<pageName>/index.html
+			// Shared assets are in saved_site/_assets/
+			// So relative link is ../_assets/<localName>
+			localRef = "../_assets/" + localName
 		}
 
 		targetURL, err := url.Parse(origURL)
@@ -610,7 +652,7 @@ func rewriteHTML(html string, baseURL string, filenameMap map[string]string) str
 // saveSiteComplete writes index.html and recreates the site's mirrored directory structure.
 func saveSiteComplete(onionAddr, fullURL string, data *ScrapedData) error {
 	pageName := generateFilenameForFile(fullURL)
-	siteDir := filepath.Join(optOutputDir, onionAddr, "saved_site", pageName)
+	siteDir := windowsFriendlyPath(filepath.Join(optOutputDir, onionAddr, "saved_site", pageName))
 
 	// Create the base site directory
 	if err := os.MkdirAll(siteDir, 0755); err != nil {
@@ -623,7 +665,8 @@ func saveSiteComplete(onionAddr, fullURL string, data *ScrapedData) error {
 		return err
 	}
 
-	// Write every captured asset into its original mirrored path
+	// Write every captured asset into a shared '_assets' folder to avoid path duplication and Windows MAX_PATH issues
+	assetsBaseDir := windowsFriendlyPath(filepath.Join(optOutputDir, onionAddr, "saved_site", "_assets"))
 	for origURL, body := range data.siteResources {
 		localRelativePath, ok := data.siteFilenames[origURL]
 		if !ok || localRelativePath == "index.html" {
@@ -635,9 +678,8 @@ func saveSiteComplete(onionAddr, fullURL string, data *ScrapedData) error {
 			continue
 		}
 
-		// --- DEEP DEFANGING ---
-		// Join with siteDir to build the full local path (e.g. siteDir/static/images/...)
-		assetPath := filepath.Join(siteDir, localRelativePath)
+		// Save to the SHARED assets folder
+		assetPath := filepath.Join(assetsBaseDir, localRelativePath)
 		assetDir := filepath.Dir(assetPath)
 		os.MkdirAll(assetDir, 0755)
 		
@@ -760,7 +802,10 @@ func formatResults(data *ScrapedData) string {
 func getInterSiteDelay() time.Duration {
 	var mean, stdDev float64
 
-	if optInterSiteDelay == 0 {
+	if optFastMode {
+		mean = 10  // 10 seconds for testing/fast scratching
+		stdDev = 2
+	} else if optInterSiteDelay == 0 {
 		// PRODUCTION: Gaussian 8-15 MINUTES
 		mean = 11.5  // (8+15)/2
 		stdDev = 1.75 // (15-8)/4
@@ -782,8 +827,13 @@ func getInterSiteDelay() time.Duration {
 		seconds = 1
 	}
 
-	// PRODUCTION: Convert to minutes
-	delay := time.Duration(seconds * 60) * time.Second
+	// PRODUCTION: Convert to duration (minutes for normal, seconds for fast)
+	var delay time.Duration
+	if optFastMode {
+		delay = time.Duration(seconds) * time.Second
+	} else {
+		delay = time.Duration(seconds*60) * time.Second
+	}
 
 	fmt.Printf("[STEALTH] Inter-site delay: %v\n", delay)
 	return delay
@@ -795,7 +845,10 @@ func getInterSiteDelay() time.Duration {
 func getIntraPageDelay() time.Duration {
 	var mean, stdDev float64
 	
-	if optIntraPageDelay == 0 {
+	if optFastMode {
+		mean = 10
+		stdDev = 2
+	} else if optIntraPageDelay == 0 {
 		// Stealth default: 60-120 sec reading time
 		mean = 90    // (60+120)/2
 		stdDev = 15  // (120-60)/4
@@ -897,11 +950,53 @@ func generateFilenameForFile(urlStr string) string {
 		return "index"
 	}
 	safe := strings.Trim(u.Path, "/")
+	
+	// If path is excessively long, hash it to ensure it fits in Windows filenames
+	if len(safe) > 100 {
+		hash := sha256.Sum256([]byte(safe))
+		return hex.EncodeToString(hash[:16]) // Short hash for stability
+	}
+	
 	safe = strings.ReplaceAll(safe, "/", "_")
 	if len(safe) > 50 {
 		safe = safe[:50]
 	}
 	return safe
+}
+
+// windowsFriendlyPath handles Windows MAX_PATH by prefixing with \\?\ for absolute paths
+func windowsFriendlyPath(path string) string {
+	if runtime.GOOS != "windows" {
+		return path
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return path
+	}
+	if !strings.HasPrefix(abs, `\\?\`) {
+		return `\\?\` + abs
+	}
+	return abs
+}
+
+func printProgress(current, total int) {
+	width := 30
+	percent := float64(current) / float64(total)
+	filled := int(percent * float64(width))
+	if filled > width { filled = width }
+	if current > total { current = total }
+
+	bar := "["
+	for i := 0; i < width; i++ {
+		if i < filled {
+			bar += "="
+		} else {
+			bar += " "
+		}
+	}
+	bar += "]"
+
+	fmt.Printf("\r[ASSETS] %s %d/%d (%.0f%%) ", bar, current, total, percent*100)
 }
 
 func checkTorConnection() bool {
