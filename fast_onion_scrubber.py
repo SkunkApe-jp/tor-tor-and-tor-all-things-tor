@@ -78,7 +78,7 @@ async def check_site(url, clients, db_path, semaphore, counter):
         
         try:
             # Note: httpx with socks5 proxy
-            response = await client.get(url, timeout=45.0, follow_redirects=True)
+            response = await client.get(url, timeout=360.0, follow_redirects=True)
             result["status"] = response.status_code
             result["title"] = extract_title(response.text)
             result["success"] = (response.status_code == 200)
