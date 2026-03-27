@@ -451,7 +451,7 @@ func processURL(browser playwright.Browser, fullURL string) (*ScrapedData, error
 			}
 			if optSaveSite {
 				// --- PROACTIVE ASSET DISCOVERY (Parallelized) ---
-				extensions := "png|jpg|jpeg|gif|ico|svg|css|xml|json|woff2?|ttf|otf|bin|pdf"
+				extensions := "png|jpg|jpeg|gif|ico|svg|css|xml|json|woff2?|ttf|otf|bin|pdf|epub|mobi|azw|mp3|mp4|zip|rar"
 				if optAllowJS {
 					extensions += "|js"
 				}
@@ -1040,7 +1040,7 @@ func extractOnionAddress(fullURL string) string {
 	re := regexp.MustCompile(`([a-z0-9.-]+\.onion)`)
 	matches := re.FindStringSubmatch(fullURL)
 	if len(matches) > 1 {
-		// Return the domain without the .onion suffix for cleaner folder names if desired, 
+		// Return the domain without the .onion suffix for cleaner folder names if desired,
 		// but keeping the full string before .onion is safer for uniqueness.
 		return strings.TrimSuffix(matches[1], ".onion")
 	}
