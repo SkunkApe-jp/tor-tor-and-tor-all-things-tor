@@ -31,9 +31,9 @@ const (
 
 // Configurable paths (set via flags)
 var (
-	optTargetsFile  string
-	optOutputDir    string
-	optLogFile      string
+	optTargetsFile string
+	optOutputDir   string
+	optLogFile     string
 )
 
 // Scraping options
@@ -52,17 +52,16 @@ var (
 	optResume         bool // Resume from log (skip already successful onions)
 )
 
-
 type ScrapedData struct {
-	pageTitle         string
-	htmlContent       string // Raw HTML
-	screenshot        []byte
-	links             []string
-	titles            map[string]string
+	pageTitle   string
+	htmlContent string // Raw HTML
+	screenshot  []byte
+	links       []string
+	titles      map[string]string
 	// Save-as-complete fields
-	siteHTML          string            // Rewritten HTML for offline use
-	siteResources     map[string][]byte // original URL -> raw bytes
-	siteFilenames     map[string]string // original URL -> local mirrored path
+	siteHTML      string            // Rewritten HTML for offline use
+	siteResources map[string][]byte // original URL -> raw bytes
+	siteFilenames map[string]string // original URL -> local mirrored path
 }
 
 func init() {
@@ -81,10 +80,8 @@ func init() {
 	flag.IntVar(&optWorkerCount, "workers", 1, "Number of parallel workers (default: 1)")
 	flag.BoolVar(&optFastMode, "fast", false, "Fast mode: reduce all stealth delays (inter-site to 5-15s, intra-page to 5-10s)")
 	flag.IntVar(&optDepth, "depth", 1, "Scrape depth (default 1 = single page, 2 = all links on page, etc.)")
-	flag.BoolVar(&optResume, "resume", true, "Resume from processed_targets.log (default: true)")
+	flag.BoolVar(&optResume, "resume", false, "Resume from processed_targets.log (default: false)")
 }
-
-
 
 func main() {
 	flag.Parse()
@@ -205,8 +202,8 @@ type ScrapingJob struct {
 }
 
 var (
-	seenURLs   = make(map[string]bool)
-	seenMu     sync.Mutex
+	seenURLs = make(map[string]bool)
+	seenMu   sync.Mutex
 )
 
 func worker(id int, jobs chan ScrapingJob, workerWg *sync.WaitGroup, taskWg *sync.WaitGroup) {
@@ -268,8 +265,10 @@ func worker(id int, jobs chan ScrapingJob, workerWg *sync.WaitGroup, taskWg *syn
 			added := 0
 			for _, link := range data.links {
 				linkParsed, err := url.Parse(link)
-				if err != nil { continue }
-				
+				if err != nil {
+					continue
+				}
+
 				// Only crawl links on the same onion hostname to avoid leaving the target
 				if linkParsed.Host == targetParsed.Host && linkParsed.Host != "" {
 					seenMu.Lock()
@@ -458,14 +457,16 @@ func processURL(browser playwright.Browser, fullURL string) (*ScrapedData, error
 				}
 				assetRegex := regexp.MustCompile(`(?i)(?:src|href|url)=['"]([^'"]+\.(?:` + extensions + `))(?:\?[^'"]*)?['"]`)
 				potentialAssets := assetRegex.FindAllStringSubmatch(html, -1)
-				
+
 				baseURLParsed, _ := url.Parse(fullURL)
-				
+
 				// Use a worker pool for assets to speed up deep pages
 				assetJobs := make(chan string, len(potentialAssets))
 				assetWg := sync.WaitGroup{}
 				assetWorkers := 5
-				if optFastMode { assetWorkers = 10 }
+				if optFastMode {
+					assetWorkers = 10
+				}
 
 				var completedMu sync.Mutex
 				completedCount := 0
@@ -477,30 +478,31 @@ func processURL(browser playwright.Browser, fullURL string) (*ScrapedData, error
 						defer assetWg.Done()
 						for assetPath := range assetJobs {
 							assetURLObj, err := baseURLParsed.Parse(assetPath)
-							if err != nil { 
+							if err != nil {
 								completedMu.Lock()
 								completedCount++
 								printProgress(completedCount, totalCount)
 								completedMu.Unlock()
-								continue 
+								continue
 							}
 							assetURL := assetURLObj.String()
-							
-							if strings.HasPrefix(assetURL, "data:") { 
+
+							if strings.HasPrefix(assetURL, "data:") {
 								completedMu.Lock()
 								completedCount++
 								printProgress(completedCount, totalCount)
 								completedMu.Unlock()
-								continue 
+								continue
 							}
 
 							resMu.Lock()
 							_, alreadyCaptured := capturedResources[assetURL]
 							resMu.Unlock()
-							
-							if !alreadyCaptured && (assetURLObj.Host == baseURLParsed.Host || assetURLObj.Host == "") {
+
+							isAssetSameHost := assetURLObj.Host == baseURLParsed.Host || strings.HasSuffix(assetURLObj.Host, "."+baseURLParsed.Host) || assetURLObj.Host == ""
+							if !alreadyCaptured && isAssetSameHost {
 								time.Sleep(100 * time.Millisecond) // Protective delay
-								
+
 								// Use browser evaluation to fetch the resource
 								fetchScript := fmt.Sprintf(`fetch("%s").then(r => r.arrayBuffer()).then(b => Array.from(new Uint8Array(b))).catch(e => null)`, assetURL)
 								if rawArr, err := page.Evaluate(fetchScript); err == nil && rawArr != nil {
@@ -508,9 +510,12 @@ func processURL(browser playwright.Browser, fullURL string) (*ScrapedData, error
 										body := make([]byte, len(resSlice))
 										for i, v := range resSlice {
 											switch val := v.(type) {
-											case float64: body[i] = byte(val)
-											case int:     body[i] = byte(val)
-											case int64:   body[i] = byte(val)
+											case float64:
+												body[i] = byte(val)
+											case int:
+												body[i] = byte(val)
+											case int64:
+												body[i] = byte(val)
 											}
 										}
 										resMu.Lock()
@@ -545,7 +550,7 @@ func processURL(browser playwright.Browser, fullURL string) (*ScrapedData, error
 					data.siteFilenames[resURL] = local
 				}
 				data.siteFilenames[fullURL] = "index.html"
-				
+
 				data.siteHTML = rewriteHTML(html, fullURL, data.siteFilenames)
 			}
 		}
@@ -627,9 +632,9 @@ func resourceRelativePath(resURL string) string {
 			parts[i] = parts[i][:120]
 		}
 	}
-	
+
 	finalName := strings.Join(parts, "/")
-	
+
 	// If it has no extension, give it a default to avoid ambiguous filenames
 	if !strings.Contains(path.Base(finalName), ".") {
 		finalName += ".bin"
@@ -668,13 +673,14 @@ func rewriteHTML(html string, baseURL string, filenameMap map[string]string) str
 		var matches []string
 		matches = append(matches, origURL)
 
-		// 1. Root-relative paths
-		if targetURL.Host == base.Host {
+		// 1. Root-relative paths and Sub-domain paths
+		isSameHost := targetURL.Host == base.Host || strings.HasSuffix(targetURL.Host, "."+base.Host) || targetURL.Host == ""
+		if isSameHost {
 			matches = append(matches, targetURL.Path)
 			if targetURL.RawQuery != "" {
 				matches = append(matches, targetURL.Path+"?"+targetURL.RawQuery)
 			}
-			
+
 			// 2. Relative paths (same-folder)
 			baseDir := path.Dir(base.Path)
 			if baseDir == "." {
@@ -695,12 +701,16 @@ func rewriteHTML(html string, baseURL string, filenameMap map[string]string) str
 		// Use single-pass replacer approach for performance
 		for _, q := range []string{`"`, `'`} {
 			for _, m := range matches {
-				if m == "" || m == "/" { continue }
+				if m == "" || m == "/" {
+					continue
+				}
 				replaces = append(replaces, q+m+q, q+localRef+q)
 			}
 		}
 		for _, m := range matches {
-			if m == "" || m == "/" { continue }
+			if m == "" || m == "/" {
+				continue
+			}
 			replaces = append(replaces, "url("+m+")", "url("+localRef+")")
 			replaces = append(replaces, "url('"+m+"')", "url('"+localRef+"')")
 			replaces = append(replaces, "url(\""+m+"\")", "url(\""+localRef+"\")")
@@ -720,7 +730,7 @@ func rewriteHTML(html string, baseURL string, filenameMap map[string]string) str
 	if !optAllowJS {
 		reScripts := regexp.MustCompile(`(?i)<script\b[^>]*>[\s\S]*?</script>|<script\b[^>]*>`)
 		html = reScripts.ReplaceAllString(html, "<!-- script stripped for safety -->")
-		
+
 		// Also strip inline "on..." event handlers (onclick, onload, etc.)
 		reEvents := regexp.MustCompile(`(?i)\s+on[a-z]+\s*=\s*['"][^'"]+['"]`)
 		html = reEvents.ReplaceAllString(html, " /* security purge: JS handler removed */")
@@ -763,7 +773,7 @@ func saveSiteComplete(onionAddr, fullURL string, data *ScrapedData) error {
 		if !ok || localRelativePath == "index.html" {
 			continue
 		}
-		
+
 		// Skip .js assets if not explicitly allowed
 		if !optAllowJS && strings.Contains(strings.ToLower(localRelativePath), ".js") {
 			continue
@@ -773,7 +783,7 @@ func saveSiteComplete(onionAddr, fullURL string, data *ScrapedData) error {
 		assetPath := filepath.Join(assetsBaseDir, localRelativePath)
 		assetDir := filepath.Dir(assetPath)
 		os.MkdirAll(assetDir, 0755)
-		
+
 		if err := os.WriteFile(assetPath, body, 0644); err != nil {
 			fmt.Printf("[WARN] Could not save asset %s: %v\n", localRelativePath, err)
 		}
@@ -830,7 +840,6 @@ func saveTitles(onionAddr, fullURL string, titles map[string]string) error {
 	return os.WriteFile(filePath, []byte(strings.Join(lines, "\n")), 0644)
 }
 
-
 func saveMainPageTitle(onionAddr, fullURL string, pageTitle string) error {
 	if pageTitle == "" {
 		return nil
@@ -845,7 +854,7 @@ func saveMainPageTitle(onionAddr, fullURL string, pageTitle string) error {
 	// Use filename to ensure uniqueness (e.g., index_title.txt vs login_title.txt)
 	filename := generateFilenameForFile(fullURL)
 	filePath := filepath.Join(titlesDir, filename+"_title.txt")
-	
+
 	// Formatting it as [Title] -> URL
 	content := fmt.Sprintf("[%s] -> %s\n", pageTitle, fullURL)
 	return os.WriteFile(filePath, []byte(content), 0644)
@@ -894,11 +903,11 @@ func getInterSiteDelay() time.Duration {
 	var mean, stdDev float64
 
 	if optFastMode {
-		mean = 10  // 10 seconds for testing/fast scratching
+		mean = 10 // 10 seconds for testing/fast scratching
 		stdDev = 2
 	} else if optInterSiteDelay == 0 {
 		// PRODUCTION: Gaussian 8-15 MINUTES
-		mean = 11.5  // (8+15)/2
+		mean = 11.5   // (8+15)/2
 		stdDev = 1.75 // (15-8)/4
 	} else {
 		// Custom: mean ± 50%
@@ -935,23 +944,23 @@ func getInterSiteDelay() time.Duration {
 // Custom: optIntraPageDelay ± 25%
 func getIntraPageDelay() time.Duration {
 	var mean, stdDev float64
-	
+
 	if optFastMode {
 		mean = 10
 		stdDev = 2
 	} else if optIntraPageDelay == 0 {
 		// Stealth default: 60-120 sec reading time
-		mean = 90    // (60+120)/2
-		stdDev = 15  // (120-60)/4
+		mean = 90   // (60+120)/2
+		stdDev = 15 // (120-60)/4
 	} else {
 		// Custom: mean ± 25%
 		mean = float64(optIntraPageDelay)
 		stdDev = mean / 4.0
 	}
-	
+
 	// Generate normal distribution value
 	seconds := (rand.NormFloat64() * stdDev) + mean
-	
+
 	// Clamp to minimum
 	minSeconds := mean - 2*stdDev
 	if seconds < minSeconds {
@@ -960,7 +969,7 @@ func getIntraPageDelay() time.Duration {
 	if seconds < 10 {
 		seconds = 10
 	}
-	
+
 	delay := time.Duration(seconds) * time.Second
 	return delay
 }
@@ -1027,10 +1036,13 @@ func appendLog(url, status, msg string, data *ScrapedData) {
 }
 
 func extractOnionAddress(fullURL string) string {
-	re := regexp.MustCompile(`([a-z2-7]{54,})\.onion`)
+	// Capture the full hostname including sub-domains (e.g. sub.addr.onion)
+	re := regexp.MustCompile(`([a-z0-9.-]+\.onion)`)
 	matches := re.FindStringSubmatch(fullURL)
 	if len(matches) > 1 {
-		return matches[1]
+		// Return the domain without the .onion suffix for cleaner folder names if desired, 
+		// but keeping the full string before .onion is safer for uniqueness.
+		return strings.TrimSuffix(matches[1], ".onion")
 	}
 	return "unknown"
 }
@@ -1041,13 +1053,13 @@ func generateFilenameForFile(urlStr string) string {
 		return "index"
 	}
 	safe := strings.Trim(u.Path, "/")
-	
+
 	// If path is excessively long, hash it to ensure it fits in Windows filenames
 	if len(safe) > 100 {
 		hash := sha256.Sum256([]byte(safe))
 		return hex.EncodeToString(hash[:16]) // Short hash for stability
 	}
-	
+
 	safe = strings.ReplaceAll(safe, "/", "_")
 	if len(safe) > 50 {
 		safe = safe[:50]
@@ -1074,8 +1086,12 @@ func printProgress(current, total int) {
 	width := 30
 	percent := float64(current) / float64(total)
 	filled := int(percent * float64(width))
-	if filled > width { filled = width }
-	if current > total { current = total }
+	if filled > width {
+		filled = width
+	}
+	if current > total {
+		current = total
+	}
 
 	bar := "["
 	for i := 0; i < width; i++ {

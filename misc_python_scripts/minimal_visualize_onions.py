@@ -12,8 +12,9 @@ import sys
 import urllib.parse
 from pathlib import Path
 
-# Pre-compiled regex for onion address validation (v2: 16 chars, v3: 56 chars, or vanity: <=56 chars)
-ONION_PATTERN = re.compile(r'^[a-z2-7]{1,56}$')
+# Pre-compiled regex for onion address validation (v3 hashes are 56 chars, legacy 16)
+# We allow 50+ chars to capture full v3 addresses and subdomains
+ONION_PATTERN = re.compile(r'^[a-z0-9.-]{50,110}$')
 
 
 def extract_title_from_html(html_file_path):
@@ -30,7 +31,8 @@ def extract_title_from_html(html_file_path):
                     title = ' '.join(title.split())
                     return title
         except Exception as e:
-            print(f"Error reading {html_file_path}: {str(e)}")
+            # print(f"Error reading {html_file_path}: {str(e)}")
+            pass
     return None
 
 
@@ -46,50 +48,52 @@ def read_links_file(links_file_path):
     return links
 
 
-def find_screenshot_path(onion_address, scraped_data_dir, url_path=""):
-    """Find the appropriate screenshot for a URL based on its path structure.
-    
-    Looks in: scraped_data/{onion_address}/images/
-    Checks: index.png, {onion_address}.png, or {url_path}.png
-    """
+def find_screenshot_path(onion_address, scraped_data_dir, url_path="", parent_onion=""):
+    """Find the appropriate screenshot for a URL based on its path structure."""
     import urllib.parse
     
-    # Clean onion address if it's a full URL
-    if '://' in onion_address:
-        parsed = urllib.parse.urlparse(onion_address)
-        onion_match = re.search(r'([a-z2-7]{1,56})\.onion', onion_address)
-        if onion_match:
-            onion_address = onion_match.group(1)
-        url_path = parsed.path
-
-    # Base image directory
-    image_dir = os.path.join(scraped_data_dir, onion_address, 'images')
+    # Process onion_address and path
+    addr_to_use = onion_address if '://' in onion_address else f"http://{onion_address}"
+    parsed = urllib.parse.urlparse(addr_to_use)
     
+    # If it's a relative link or has no host, use the parent onion address
+    host = parsed.netloc
+    if not host and parent_onion:
+        # Use parent host but ensure it's just the host part
+        host = parent_onion.replace('http://', '').replace('https://', '').split('/')[0]
+        if '.onion' not in host:
+            host += ".onion"
+    
+    clean_addr = host.replace('.onion', '')
+    if not clean_addr:
+        return "", None
+
+    # Determine the target path for slugging
+    if not url_path:
+        url_path = parsed.path
+    
+    # Base image directory
+    image_dir = os.path.join(scraped_data_dir, clean_addr, 'images')
     if not os.path.exists(image_dir):
         return "", None
 
-    # Check for index.png (root page screenshot)
-    index_path = os.path.join(image_dir, "index.png")
-    if os.path.exists(index_path):
-        viz_dir = os.path.join(scraped_data_dir, onion_address, 'visualizations')
-        rel_path = os.path.relpath(index_path, viz_dir)
-        return rel_path.replace('\\', '/'), None
+    viz_dir = os.path.join(scraped_data_dir, clean_addr, 'visualizations')
 
-    # Check for {onion_address}.png
-    onion_path = os.path.join(image_dir, f"{onion_address}.png")
-    if os.path.exists(onion_path):
-        viz_dir = os.path.join(scraped_data_dir, onion_address, 'visualizations')
-        rel_path = os.path.relpath(onion_path, viz_dir)
-        return rel_path.replace('\\', '/'), None
+    # 1. Check for specific {url_path}.png (highest priority)
+    if url_path:
+        clean_path = url_path.strip('/')
+        if clean_path:
+            safe_name = clean_path.replace('/', '_').replace('.', '_')
+            path_path = os.path.join(image_dir, f"{safe_name}.png")
+            if os.path.exists(path_path):
+                rel_path = os.path.relpath(path_path, viz_dir)
+                return rel_path.replace('\\', '/'), None
 
-    # Check for {url_path}.png if URL path provided
-    if url_path and url_path != '/':
-        # Clean the path for filename
-        safe_name = url_path.strip('/').replace('/', '_').replace('.', '_')
-        path_path = os.path.join(image_dir, f"{safe_name}.png")
-        if os.path.exists(path_path):
-            viz_dir = os.path.join(scraped_data_dir, onion_address, 'visualizations')
-            rel_path = os.path.relpath(path_path, viz_dir)
+    # 2. Check for index.png (root page screenshot) ONLY if looking at the root path or if it's the exact target
+    if url_path == "" or url_path == "/":
+        index_path = os.path.join(image_dir, "index.png")
+        if os.path.exists(index_path):
+            rel_path = os.path.relpath(index_path, viz_dir)
             return rel_path.replace('\\', '/'), None
 
     return "", None
@@ -97,17 +101,21 @@ def find_screenshot_path(onion_address, scraped_data_dir, url_path=""):
 
 def generate_visualization(target_onion, scraped_data_dir):
     """Generate HTML visualization for a specific onion site."""
-
-    # Get the clean onion name for directory and filenames
-    clean_onion = target_onion.replace('http://', '').replace('https://', '').replace('.onion', '')
+    parsed_target = urllib.parse.urlparse(target_onion if '://' in target_onion else f"http://{target_onion}")
+    
+    # The folder name is just the host (without .onion)
+    clean_onion = parsed_target.netloc.replace('.onion', '')
+    if not clean_onion:
+        return None
 
     # Prepare paths
-    onion_dir = os.path.join(scraped_data_dir, clean_onion)
+    onion_dir = os.path.normpath(os.path.join(scraped_data_dir, clean_onion))
     
     # Validate that the onion directory exists
     if not os.path.exists(onion_dir):
-        print(f"[ERROR] Onion directory not found: {onion_dir}")
-        print(f"[INFO] Expected folder for '{target_onion}' does not exist.")
+        # Only print error if it's not a known artifact folder like 'visualizations' or 'mirrors.json'
+        if ONION_PATTERN.match(clean_onion) and clean_onion != "visualizations":
+            print(f"[ERROR] Onion directory not found: {onion_dir}")
         return None
     
     if not os.path.isdir(onion_dir):
@@ -119,7 +127,11 @@ def generate_visualization(target_onion, scraped_data_dir):
     htmls_dir = os.path.join(onion_dir, 'htmls')
 
     # Get title for the root node
-    root_html_file = os.path.join(htmls_dir, f"{clean_onion}.html")
+    url_path = urllib.parse.urlparse(target_onion).path.strip('/')
+    path_slug = url_path.replace('/', '_').replace('.', '_')
+    html_filename = f"{path_slug}.html" if path_slug else "index.html"
+    
+    root_html_file = os.path.join(htmls_dir, html_filename)
     root_title = extract_title_from_html(root_html_file)
     if not root_title:
         root_title = target_onion  # fallback to URL if no title found
@@ -148,334 +160,419 @@ def generate_visualization(target_onion, scraped_data_dir):
     seen = set()
     unique_outbound_links = []
     for link in outbound_links:
-        if link not in seen:
-            seen.add(link)
-            unique_outbound_links.append(link)
+        # Strip query parameters for deduplication and cleaner visualization
+        clean_link = link.split('?')[0].rstrip('/')
+        if clean_link not in seen:
+            seen.add(clean_link)
+            unique_outbound_links.append(link) # Keep original for ID but we'll use clean_link for structure
 
-    outbound_links = unique_outbound_links
+    # 1. Build a Hierarchical Tree Structure from Paths
+    # This prevents the "starburst explosion" by grouping nodes into folders
+    # Root: onion.onion
+    # Child: /archives/ (folder)
+    # Grandchild: /archives/books/ (folder)
+    # Great-grandchild: /archives/books/index.html (file)
+    
+    # helper to find/create child in tree
+    def get_or_create_node(parent, node_id, name, is_folder=False):
+        for child in parent.setdefault("children", []):
+            if child["id"] == node_id:
+                return child
+        new_node = {
+            "id": node_id,
+            "name": name,
+            "title": name,
+            "is_folder": is_folder,
+            "children": []
+        }
+        parent["children"].append(new_node)
+        return new_node
 
-    # Create the root node
-    root_image_path, _ = find_screenshot_path(target_onion, scraped_data_dir)
+    root_image_path, _ = find_screenshot_path(target_onion, scraped_data_dir, parent_onion=target_onion)
     root_node = {
         "id": target_onion,
         "name": target_onion,
         "title": root_title,
         "image": root_image_path,
+        "is_root": True,
         "children": []
     }
 
-    # Add outbound links as children
-    for i, link in enumerate(outbound_links):
-        # Extract onion address from link
-        onion_match = re.search(r'([a-z2-7]{1,56})\.onion', link)
-        if onion_match:
-            # Check if this is a link to the same onion site (internal sub-page)
-            target_onion_clean = target_onion.replace('http://', '').replace('https://', '').replace('.onion', '')
-            linked_onion = onion_match.group(1)
-
-            # Get title from the scraped HTML if it exists
-            link_html_file = os.path.join(scraped_data_dir, linked_onion, 'htmls', f"{linked_onion}.html")
-
-            # If it's the same onion site, look for the specific HTML file
-            if linked_onion == target_onion_clean:
-                # For internal links, construct the proper HTML file path based on the URL
-                path_parts = [p for p in urllib.parse.urlparse(link).path.strip('/').split('/') if p]
-
-                # Start with the base htmls directory
-                html_dir = os.path.join(scraped_data_dir, target_onion_clean, 'htmls')
-
-                # Build the subdirectory path based on URL path
-                for part in path_parts[:-1]:  # All parts except the last one form the directory structure
-                    html_dir = os.path.join(html_dir, part)
-
-                # Create the expected filename based on the URL
-                if path_parts:  # If there are path parts
-                    last_part = path_parts[-1]  # The last part of the path
-                    # Create filename similar to how the Go app generates it
-                    if '.' in last_part:
-                        # If it's a file with extension, replace dots with underscores
-                        clean_last_part = last_part.replace('.', '_')
-                        expected_filename = f"{target_onion_clean}_{clean_last_part}.html"
-                    else:
-                        # If it's a directory path
-                        expected_filename = f"{target_onion_clean}_{last_part}.html"
-
-                    link_html_file = os.path.join(html_dir, expected_filename)
-                else:
-                    # Root page
-                    link_html_file = os.path.join(html_dir, f"{target_onion_clean}.html")
-
-            link_title = extract_title_from_html(link_html_file)
-            if not link_title:
-                link_title = link  # fallback to URL if no title found
-
-            # Find screenshot path
-            image_path, _ = find_screenshot_path(link, scraped_data_dir, urllib.parse.urlparse(link).path)
-
-            child_node = {
+    # Process each link into the tree
+    for link in unique_outbound_links:
+        parsed = urllib.parse.urlparse(link)
+        if parsed.netloc != f"{clean_onion}.onion" and parsed.netloc != "":
+            # External link - keep as direct child of root for now or categorize as 'External'
+            ext_root = get_or_create_node(root_node, "external_sites", "External Connections", True)
+            image_path, _ = find_screenshot_path(link, scraped_data_dir, parent_onion=target_onion)
+            ext_root["children"].append({
                 "id": link,
-                "name": link,
-                "title": link_title,
+                "name": parsed.netloc,
+                "title": link,
                 "image": image_path,
-            }
-            root_node["children"].append(child_node)
+                "is_external": True
+            })
+            continue
+
+        # Internal path-based hierarchy
+        path = parsed.path.strip('/')
+        if not path: continue # Skip root variations
+        
+        parts = path.split('/')
+        current = root_node
+        current_path = f"http://{clean_onion}.onion"
+        
+        for i, part in enumerate(parts):
+            current_path += "/" + part
+            is_last = (i == len(parts) - 1)
+            
+            # If it's the last part, it's the actual node
+            if is_last:
+                # Get title and image for the final node
+                image_path, _ = find_screenshot_path(link, scraped_data_dir, parsed.path, parent_onion=target_onion)
+                
+                # Check for existing node (might have been created as a folder earlier)
+                node = None
+                for c in current.get("children", []):
+                    if c["id"] == link:
+                        node = c
+                        break
+                
+                if node:
+                    node["image"] = image_path
+                    # update title if we find a better one
+                else:
+                    current.setdefault("children", []).append({
+                        "id": link,
+                        "name": part,
+                        "title": part,
+                        "image": image_path
+                    })
+            else:
+                # Intermediate folder node
+                current = get_or_create_node(current, current_path, part, True)
+
+    # Clean up empty children arrays to make D3 happy
+    def prune_empty_children(node):
+        if "children" in node:
+            if not node["children"]:
+                del node["children"]
+            else:
+                for child in node["children"]:
+                    prune_empty_children(child)
+    
+    prune_empty_children(root_node)
 
     # Generate HTML with embedded JavaScript for D3 visualization
     html_content = f"""<!DOCTYPE html>
 <html>
 <head>
-    <title>{target_onion} Network Visualization</title>
+    <meta charset="utf-8">
+    <title>{target_onion} Archive Map</title>
     <script src="https://d3js.org/d3.v7.min.js"></script>
     <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&family=JetBrains+Mono&display=swap');
+        
         body {{
             margin: 0;
             overflow: hidden;
-            background-color: white;
-            font-family: Arial, sans-serif;
+            background-color: #050505;
+            color: #eee;
+            font-family: 'Inter', sans-serif;
         }}
+        
         #tooltip {{
             position: absolute;
             text-align: left;
-            padding: 10px;
-            font-size: 14px;
-            background: rgba(255, 255, 255, 0.95);
-            color: black;
-            border: 1px solid #ccc;
+            padding: 15px;
+            font-size: 13px;
+            background: rgba(10, 10, 10, 0.9);
+            backdrop-filter: blur(10px);
+            color: white;
+            border: 1px solid rgba(255, 255, 255, 0.1);
             border-radius: 4px;
             pointer-events: none;
             opacity: 0;
             transition: opacity 0.3s;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-            max-width: 300px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+            max-width: 320px;
             z-index: 100;
         }}
-        .node {{
-            cursor: pointer;
-        }}
-        .link {{
-            stroke: #999;
-            stroke-opacity: 0.6;
-        }}
-        #title {{
+        
+        #title-overlay {{
             position: absolute;
-            top: 10px;
-            left: 10px;
-            color: black;
-            font-size: 16px;
+            top: 25px;
+            left: 25px;
             z-index: 10;
-            background: rgba(255, 255, 255, 0.8);
-            padding: 5px 10px;
-            border-radius: 4px;
-            border: 1px solid #ddd;
         }}
+        
+        #title-overlay h1 {{
+            margin: 0;
+            font-size: 1.2rem;
+            font-weight: 600;
+            letter-spacing: 1px;
+            text-transform: uppercase;
+            color: #fff;
+        }}
+        
+        #title-overlay p {{
+            margin: 5px 0 0 0;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.8rem;
+            color: #555;
+        }}
+
         #controls {{
             position: absolute;
-            top: 10px;
-            right: 10px;
+            bottom: 30px;
+            right: 30px;
             z-index: 10;
             display: flex;
-            flex-direction: column;
-            gap: 5px;
+            gap: 10px;
         }}
+        
         .control-btn {{
-            background: rgba(255, 255, 255, 0.8);
-            border: 1px solid #ddd;
-            border-radius: 4px;
-            padding: 8px 12px;
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 50%;
+            width: 45px;
+            height: 45px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
             cursor: pointer;
-            font-size: 14px;
-            color: black;
-            text-align: center;
-            min-width: 40px;
-            user-select: none;
+            color: white;
+            transition: 0.2s;
         }}
+        
         .control-btn:hover {{
-            background: rgba(240, 240, 240, 0.9);
+            background: #fff;
+            color: #000;
+        }}
+
+        .link {{
+            stroke: #222;
+            stroke-opacity: 0.4;
+            stroke-width: 1.5;
+        }}
+        
+        .node circle {{
+            stroke: #000;
+            stroke-width: 1.5;
+        }}
+        
+        .node text {{
+            font-size: 10px;
+            fill: #444;
+            pointer-events: none;
         }}
     </style>
 </head>
 <body>
-    <div id="title">{target_onion} Network</div>
-    <div id="controls">
-        <button class="control-btn" onclick="zoomIn()">+</button>
-        <button class="control-btn" onclick="zoomOut()">-</button>
-        <button class="control-btn" onclick="resetView()">↺</button>
+    <div id="title-overlay">
+        <h1>{root_title[:40]}{"..." if len(root_title)>40 else ""}</h1>
+        <p>{target_onion}</p>
     </div>
-    <div id="tooltip"></div>
-    <script>
-        // Hierarchical data structure
-        const data = {json.dumps(root_node)};
+    
+    <div id="controls">
+        <div class="control-btn" onclick="zoomIn()" title="Zoom In">+</div>
+        <div class="control-btn" onclick="zoomOut()" title="Zoom Out">-</div>
+        <div class="control-btn" onclick="resetView()" title="Reset">↺</div>
+    </div>
 
-        // Chart dimensions
+    <div id="tooltip"></div>
+
+    <script>
+        const data = {json.dumps(root_node)};
         const width = window.innerWidth;
         const height = window.innerHeight;
 
-        // Compute the graph and start the force simulation
+        const svg = d3.select("body").append("svg")
+            .attr("width", width)
+            .attr("height", height);
+        // Define arrowhead marker
+        const g = svg.append("g");
+        g.append("defs").append("marker")
+            .attr("id", "arrowhead")
+            .attr("viewBox", "0 -5 10 10")
+            .attr("refX", 10)
+            .attr("refY", 0)
+            .attr("orient", "auto")
+            .attr("markerWidth", 4)
+            .attr("markerHeight", 4)
+            .append("path")
+            .attr("d", "M0,-5 L10,0 L0,5")
+            .attr("fill", "#666");
+
+        const zoom = d3.zoom()
+            .scaleExtent([0.1, 8])
+            .on("zoom", (event) => g.attr("transform", event.transform));
+
+        svg.call(zoom);
+
+        // Process Hierarchy
         const root = d3.hierarchy(data);
         const links = root.links();
         const nodes = root.descendants();
 
-        // Pre-position nodes to prevent "explosion" from center
-        nodes.forEach((d, i) => {{
-            d.x = width / 2 + (Math.random() - 0.5) * 100;
-            d.y = height / 2 + (Math.random() - 0.5) * 100;
-        }});
-
-        // Create the container SVG
-        const svg = d3.select("body")
-            .append("svg")
-            .attr("width", "100%")
-            .attr("height", "100%")
-            .attr("viewBox", [0, 0, width, height])
-            .attr("style", "max-width: 100%; height: 100vh;");
-
-        // Add zoom functionality with panning
-        const zoom = d3.zoom()
-            .scaleExtent([0.05, 10])
-            .on("zoom", (event) => {{
-                g.attr("transform", event.transform);
-            }});
-        svg.call(zoom);
-
-        // Create zoom functions
-        function zoomIn() {{
-            svg.transition().duration(400).call(zoom.scaleBy, 1.5);
-        }}
-
-        function zoomOut() {{
-            svg.transition().duration(400).call(zoom.scaleBy, 0.6);
-        }}
-
-        function resetView() {{
-            svg.transition().duration(750).call(zoom.transform, d3.zoomIdentity);
-        }}
-
-        // Create a group for zooming
-        const g = svg.append("g");
-
-        // Create force simulation with improved stability
+        // Simulation setup
         const simulation = d3.forceSimulation(nodes)
-            .alphaDecay(0.04)
-            .force("link", d3.forceLink(links).id(d => d.data.id).distance(150).strength(0.4))
-            .force("charge", d3.forceManyBody().strength(-200).distanceMax(500))
-            .force("x", d3.forceX(width / 2).strength(0.06))
-            .force("y", d3.forceY(height / 2).strength(0.06))
-            .force("collision", d3.forceCollide().radius(function(d) {{ return d.data.image && d.data.image !== "" ? 50 : 12; }}));
+            .force("link", d3.forceLink(links).id(d => d.id).distance(100).strength(0.5))
+            .force("charge", d3.forceManyBody().strength(-300))
+            .force("center", d3.forceCenter(width / 2, height / 2))
+            .force("collision", d3.forceCollide().radius(d => d.data.image ? 40 : 20));
 
-        // Append links
+        // Draw links
         const link = g.append("g")
-            .attr("stroke", "#666")  // Dark gray for B&W theme
-            .attr("stroke-opacity", 0.7)
+            .attr("class", "links")
             .selectAll("line")
             .data(links)
-            .join("line");
+            .join("line")
+            .attr("class", "link")
+            .attr("marker-end", "url(#arrowhead)");
 
-        // Create tooltip
-        const tooltip = d3.select("#tooltip");
-
-        // Create groups for nodes
+        // Draw nodes
         const node = g.append("g")
             .selectAll("g")
             .data(nodes)
             .join("g")
-            .attr("cursor", "move")  // Indicate draggable
+            .attr("class", "node")
             .call(d3.drag()
                 .on("start", dragstarted)
                 .on("drag", dragged)
-                .on("end", dragended));
+                .on("end", dragended));        // Node Visuals
+        node.each(function(d) {{
+            const el = d3.select(this);
+            
+            if (d.data.image) {{
+                // Image node
+                el.append("defs")
+                  .append("clipPath")
+                  .attr("id", "clip-" + d.index)
+                  .append("circle")
+                  .attr("r", 30);
 
-        function dragstarted(event, d) {{
-            if (!event.active) simulation.alphaTarget(0.3).restart();
-            d.fx = d.x;
-            d.fy = d.y;
-        }}
+                el.append("circle")
+                  .attr("r", 32)
+                  .attr("fill", "none")
+                  .attr("stroke", "#fff")
+                  .attr("stroke-width", 2);
 
-        function dragged(event, d) {{
-            d.fx = event.x;
-            d.fy = event.y;
-        }}
-
-        function dragended(event, d) {{
-            if (!event.active) simulation.alphaTarget(0.05);  // Lower alpha for smoother settling
-            // Allow releasing the fixed position after a delay if desired
-            // Or keep it fixed by leaving d.fx and d.fy as set
-        }}
-
-        // Add images for nodes that have screenshots
-        node.filter(d => d.data.image && d.data.image !== "")
-            .append("image")
-            .attr("xlink:href", d => d.data.image)
-            .attr("x", d => d.x - (d.depth === 0 ? 40 : 20))  // 10x larger when image is present
-            .attr("y", d => d.y - (d.depth === 0 ? 40 : 20))  // 10x larger when image is present
-            .attr("width", d => d.depth === 0 ? 80 : 40)  // 10x larger when image is present
-            .attr("height", d => d.depth === 0 ? 80 : 40)  // 10x larger when image is present
-            .attr("clip-path", "circle()");
-
-        // Add circles for nodes that don't have screenshots
-        node.filter(d => !(d.data.image && d.data.image !== ""))
-            .append("circle")
-            .attr("r", d => d.depth === 0 ? 6 : 2.5)  // Medium root node, smaller others
-            .attr("fill", "#000")  // Black fill for B&W theme
-            .attr("stroke", "#000")
-            .attr("stroke-width", 1.5);
-
-        // Add hover functionality
-        node.on("mouseover", function(event, d) {{
-            const imgPath = d.data.image;
-            tooltip.transition()
-                .duration(200)
-                .style("opacity", .95);
-            if (imgPath && imgPath !== "") {{
-                // Show image in tooltip even for root node
-                // Construct the full path for the tooltip preview
-                const fullPath = imgPath.startsWith('../') || imgPath.startsWith('./') ?
-                                 imgPath :
-                                 `images/${{imgPath}}`;
-                tooltip.html(`<div><strong style="word-break: break-all;">${{d.data.title}}</strong></div><div style="font-size: 12px; color: #666; margin: 5px 0; word-break: break-all;">${{d.data.id}}</div><img src="${{fullPath}}" style="max-width: 200px; max-height: 150px; margin-top: 5px; border: 1px solid #ddd;" onerror="this.parentNode.innerHTML+='<div style=\\'color:red; font-size:12px; word-break: break-all;\\'>${{d.data.title}}<br/>${{d.data.id}}<br/>Image not available</div>';">`)
-                    .style("left", (event.pageX + 10) + "px")
-                    .style("top", (event.pageY - 28) + "px");
+                el.append("image")
+                  .attr("xlink:href", d.data.image)
+                  .attr("x", -30)
+                  .attr("y", -30)
+                  .attr("width", 60)
+                  .attr("height", 60)
+                  .attr("clip-path", "url(#clip-" + d.index + ")");
             }} else {{
-                tooltip.html(`<div><strong style="word-break: break-all;">${{d.data.title}}</strong></div><div style="font-size: 12px; color: #666; margin: 5px 0; word-break: break-all;">${{d.data.id}}</div><div style='color:red; font-size:12px;'>Image not available</div>`)
-                    .style("left", (event.pageX + 10) + "px")
-                    .style("top", (event.pageY - 28) + "px");
+                // Geometric node
+                let color = "#333";
+                let radius = 5;
+                
+                if (d.data.is_root) {{ color = "#fff"; radius = 10; }}
+                else if (d.data.is_folder) {{ color = "#0078D7"; radius = 7; }}
+                else if (d.data.is_external) {{ color = "#ff4d4d"; radius = 6; }}
+                
+                el.append("circle")
+                  .attr("r", radius)
+                  .attr("fill", color)
+                  .attr("filter", d.data.is_root ? "drop-shadow(0 0 5px rgba(255,255,255,0.5))" : "none");
             }}
-        }})
-        .on("mouseout", function(d) {{
-            tooltip.transition()
-                .duration(500)
-                .style("opacity", 0);
+            
+            // Labels only for significant nodes or when zoomed
+            if (d.data.is_root || d.data.is_folder || d.depth < 2) {{
+                el.append("text")
+                  .attr("dy", d.data.image ? 45 : 15)
+                  .attr("text-anchor", "middle")
+                  .text(d.data.name.length > 20 ? d.data.name.substring(0, 17) + "..." : d.data.name);
+            }}
         }});
 
-        // Update positions on each tick
+        // Tooltip interaction
+        node.on("mouseover", (event, d) => {{
+            d3.select("#tooltip")
+                .style("opacity", 1)
+                .html(`
+                    <div style="margin-bottom:8px; font-weight:600; color:#fff;">${{d.data.title}}</div>
+                    <div style="font-family:monospace; font-size:11px; color:#666; word-break:break-all;">${{d.data.id}}</div>
+                    ${{d.data.image ? `<img src="${{d.data.image}}" style="width:100%; margin-top:10px; border:1px solid #222;">` : ''}}
+                `)
+                .style("left", (event.pageX + 20) + "px")
+                .style("top", (event.pageY - 20) + "px");
+        }}).on("mouseout", () => {{
+            d3.select("#tooltip").style("opacity", 0);
+        }});
+
         simulation.on("tick", () => {{
             link
                 .attr("x1", d => d.source.x)
                 .attr("y1", d => d.source.y)
-                .attr("x2", d => d.target.x)
-                .attr("y2", d => d.target.y);
+                .attr("x2", d => {{
+                    // Logic to make arrow stop at the node's edge
+                    let radius = 10; // Default
+                    if (d.target.data.image) radius = 35;
+                    else if (d.target.data.is_root) radius = 12;
+                    else if (d.target.data.is_folder) radius = 9;
+                    else if (d.target.data.is_external) radius = 8;
+                    
+                    const dx = d.target.x - d.source.x;
+                    const dy = d.target.y - d.source.y;
+                    const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+                    return d.target.x - (dx * radius / dist);
+                }})
+                .attr("y2", d => {{
+                    let radius = 10; // Default
+                    if (d.target.data.image) radius = 35;
+                    else if (d.target.data.is_root) radius = 12;
+                    else if (d.target.data.is_folder) radius = 9;
+                    else if (d.target.data.is_external) radius = 8;
+                    
+                    const dx = d.target.x - d.source.x;
+                    const dy = d.target.y - d.source.y;
+                    const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+                    return d.target.y - (dy * radius / dist);
+                }});
 
-            node
-                .attr("transform", d => `translate(${{d.x}},${{d.y}})`);
+            node.attr("transform", d => `translate(${{d.x}},${{d.y}})`);
         }});
 
-        // Handle window resize
-        window.addEventListener("resize", () => {{
-            const newWidth = window.innerWidth;
-            const newHeight = window.innerHeight;
+        function dragstarted(event, d) {{
+            if (!event.active) simulation.alphaTarget(0.3).restart();
+            d.fx = d.x; d.fy = d.y;
+        }}
+        function dragged(event, d) {{
+            d.fx = event.x; d.fy = event.y;
+        }}
+        function dragended(event, d) {{
+            if (!event.active) simulation.alphaTarget(0);
+            d.fx = null; d.fy = null;
+        }}
 
-            svg.attr("width", newWidth)
-               .attr("height", newHeight);
-        }});
+        function zoomIn() {{ svg.transition().call(zoom.scaleBy, 1.5); }}
+        function zoomOut() {{ svg.transition().call(zoom.scaleBy, 0.7); }}
+        function resetView() {{ svg.transition().call(zoom.transform, d3.zoomIdentity); }}
+
     </script>
 </body>
 </html>"""
 
-    # Create visualization directory for this onion inside its own directory
+    # Create a unique filename based on the target URL path to avoid overwrites
+    # library.onion -> library_viz.html
+    # library.onion/archives/ -> library_archives_viz.html
+    url_path = urllib.parse.urlparse(target_onion).path.strip('/')
+    path_slug = url_path.replace('/', '_').replace('.', '_')
+    file_prefix = f"{clean_onion}_{path_slug}" if path_slug else clean_onion
+    
+    # Create web-friendly filename
+    viz_filename = f"{file_prefix}_viz.html"
+
+    # Create visualization directory
     viz_dir = os.path.join(scraped_data_dir, clean_onion, 'visualizations')
     os.makedirs(viz_dir, exist_ok=True)
 
     # Write the HTML file
-    output_file = os.path.join(viz_dir, f"{clean_onion}_viz.html")
+    output_file = os.path.join(viz_dir, viz_filename)
     with open(output_file, 'w', encoding='utf-8') as f:
         f.write(html_content)
 
@@ -490,9 +587,12 @@ def visualize_all_onions(scraped_data_dir):
         return
 
     # Get all directories in scraped_data_dir that look like onion addresses
+    # (Exclude known system/utility folders)
+    excluded_dirs = ["visualizations", "discovered_links"]
     onion_dirs = [d for d in os.listdir(scraped_data_dir)
                   if os.path.isdir(os.path.join(scraped_data_dir, d))
-                  and ONION_PATTERN.match(d)]
+                  and ONION_PATTERN.match(d)
+                  and d.lower() not in excluded_dirs]
 
     if not onion_dirs:
         print(f"No onion directories found in {scraped_data_dir}")
@@ -503,14 +603,33 @@ def visualize_all_onions(scraped_data_dir):
     for i, onion_addr in enumerate(onion_dirs):
         print(f"\nProcessing ({i+1}/{len(onion_dirs)}): {onion_addr}")
 
-        # Format the onion URL properly
+        # Format the onion URL properly for the index root
         target_onion = f"http://{onion_addr}.onion"
+        
+        # Collect all explicit targets scraped for this onion
+        targets_to_visualize = {target_onion} # Use set to avoid duplicates
+        identity_dir = os.path.join(scraped_data_dir, onion_addr, "website_identity")
+        
+        if os.path.exists(identity_dir):
+            for title_file in os.listdir(identity_dir):
+                if title_file.endswith('_title.txt'):
+                    try:
+                        with open(os.path.join(identity_dir, title_file), 'r', encoding='utf-8') as f:
+                            content = f.read().strip()
+                            # Read format: [Title] -> http://url...
+                            if '->' in content:
+                                sub_url = content.split('->', 1)[1].strip()
+                                targets_to_visualize.add(sub_url)
+                    except:
+                        pass
 
-        try:
-            generate_visualization(target_onion, scraped_data_dir)
-        except Exception as e:
-            print(f"Error processing {onion_addr}: {str(e)}")
-            continue
+        for t in targets_to_visualize:
+            print(f" -> Mapping Target: {t}")
+            try:
+                generate_visualization(t, scraped_data_dir)
+            except Exception as e:
+                print(f"Error processing {t}: {str(e)}")
+                continue
 
     print("\nAll visualizations completed!")
 
