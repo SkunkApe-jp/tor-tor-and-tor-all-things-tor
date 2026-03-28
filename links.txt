@@ -1,0 +1,7 @@
+# Add your links here (one per line)
+# Lines starting with # are ignored
+# Optional: Add a title after the URL separated by space or tab
+
+https://github.com GitHub
+https://stackoverflow.com Stack Overflow
+https://python.org Python
