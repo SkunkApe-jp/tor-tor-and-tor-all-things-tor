@@ -50,6 +50,7 @@ var (
 	optWorkerCount    int  // Number of parallel workers
 	optFastMode       bool // Fast mode: reduce all stealth delays (inter-site to 5-15s, intra-page to 5-10s)
 	optDepth          int  // Scrape depth (default 1)
+	optPageLoadWait   int  // Post-Goto render wait in seconds (default: 45s, 8s in fast mode)
 	optSaveClearweb   bool // Save clearweb (non-onion) links
 	optResume         bool // Resume from log (skip already successful onions)
 	optCrossOrigin    bool // Save cross-origin assets (external domains)
@@ -85,6 +86,7 @@ func init() {
 	flag.IntVar(&optWorkerCount, "workers", 1, "Number of parallel workers (default: 1)")
 	flag.BoolVar(&optFastMode, "fast", false, "Fast mode: reduce all stealth delays (inter-site to 5-15s, intra-page to 5-10s)")
 	flag.IntVar(&optDepth, "depth", 1, "Scrape depth (default 1 = single page, 2 = all links on page, etc.)")
+	flag.IntVar(&optPageLoadWait, "page-load-wait", 0, "Seconds to wait after page load for JS render (0=auto: 45s normal, 8s fast)")
 	flag.BoolVar(&optSaveClearweb, "clearweb", true, "Save discovered clearweb (non-onion) links")
 	flag.BoolVar(&optResume, "resume", false, "Resume from log (skip already successful onions)")
 	flag.BoolVar(&optCrossOrigin, "cross-origin", true, "Save cross-origin assets from external domains (may be large)")
@@ -482,12 +484,35 @@ func processURL(browser playwright.Browser, fullURL string, proxyServer string) 
 		return nil, err
 	}
 
-	// Wait for page render and scroll for lazy-loaded content
-	time.Sleep(5 * time.Second)
-	_, _ = page.Evaluate(`window.scrollTo(0, document.body.scrollHeight)`)
-	time.Sleep(3 * time.Second)
+	// Wait for network to go idle (all in-flight requests finished).
+	// On slow onion connections this is the most reliable signal that the
+	// page is truly done loading. Timeout is generous — 3 minutes.
+	if err := page.WaitForLoadState(playwright.PageWaitForLoadStateOptions{
+		State:   playwright.LoadStateNetworkidle,
+		Timeout: playwright.Float(180000), // 3 min
+	}); err != nil {
+		// Non-fatal: page might still be usable, log and continue
+		fmt.Printf("[WARN] networkidle timeout for %s: %v\n", fullURL, err)
+	}
 
-	// Intra-page "reading" delay - simulate human browsing
+	// Render wait: give JS frameworks time to paint after network idle.
+	// Default: 45s normal mode, 8s fast mode. Override with --page-load-wait.
+	renderWait := optPageLoadWait
+	if renderWait <= 0 {
+		if optFastMode {
+			renderWait = 8
+		} else {
+			renderWait = 45
+		}
+	}
+	fmt.Printf("[RENDER] Waiting %ds for JS render...\n", renderWait)
+	time.Sleep(time.Duration(renderWait) * time.Second)
+
+	// Scroll to trigger lazy-loaded images/assets, then wait half the render time
+	_, _ = page.Evaluate(`window.scrollTo(0, document.body.scrollHeight)`)
+	time.Sleep(time.Duration(renderWait/2) * time.Second)
+
+	// Intra-page "reading" delay - simulate human browsing (stealth only)
 	readingDelay := getIntraPageDelay()
 	fmt.Printf("[READ] Simulating human reading: %v\n", readingDelay)
 	time.Sleep(readingDelay)
@@ -878,21 +903,25 @@ func rewriteHTML(html string, baseURL string, filenameMap map[string]string) str
 // saveSiteComplete writes index.html and recreates the site's mirrored directory structure.
 func saveSiteComplete(onionAddr, fullURL string, data *ScrapedData) error {
 	pageName := generateFilenameForFile(fullURL)
-	siteDir := windowsFriendlyPath(filepath.Join(optOutputDir, onionAddr, "saved_site", pageName))
+
+	// Build paths WITHOUT \\?\ prefix so filepath.Join never mangles it.
+	// windowsFriendlyPath is applied only at the point of the actual OS call.
+	siteDir := filepath.Join(optOutputDir, onionAddr, "saved_site", pageName)
 
 	// Create the base site directory
-	if err := os.MkdirAll(siteDir, 0755); err != nil {
+	if err := os.MkdirAll(windowsFriendlyPath(siteDir), 0755); err != nil {
 		return err
 	}
 
 	// Write rewritten HTML
 	htmlPath := filepath.Join(siteDir, "index.html")
-	if err := os.WriteFile(htmlPath, []byte(data.siteHTML), 0644); err != nil {
+	if err := os.WriteFile(windowsFriendlyPath(htmlPath), []byte(data.siteHTML), 0644); err != nil {
 		return err
 	}
 
-	// Write every captured asset into a shared '_assets' folder to avoid path duplication and Windows MAX_PATH issues
-	assetsBaseDir := windowsFriendlyPath(filepath.Join(optOutputDir, onionAddr, "saved_site", "_assets"))
+	// Write every captured asset into a shared '_assets' folder to avoid
+	// path duplication and Windows MAX_PATH issues.
+	assetsBaseDir := filepath.Join(optOutputDir, onionAddr, "saved_site", "_assets")
 	for origURL, body := range data.siteResources {
 		localRelativePath, ok := data.siteFilenames[origURL]
 		if !ok || localRelativePath == "index.html" {
@@ -907,14 +936,14 @@ func saveSiteComplete(onionAddr, fullURL string, data *ScrapedData) error {
 		// Save to the SHARED assets folder
 		assetPath := filepath.Join(assetsBaseDir, localRelativePath)
 		assetDir := filepath.Dir(assetPath)
-		os.MkdirAll(assetDir, 0755)
+		os.MkdirAll(windowsFriendlyPath(assetDir), 0755)
 
-		if err := os.WriteFile(assetPath, body, 0644); err != nil {
+		if err := os.WriteFile(windowsFriendlyPath(assetPath), body, 0644); err != nil {
 			fmt.Printf("[WARN] Could not save asset %s: %v\n", localRelativePath, err)
 		}
 	}
 
-	fmt.Printf("[SITE] Professional mirror saved to %s (%d assets)\n", siteDir, len(data.siteResources))
+	fmt.Printf("[SITE] Professional mirror saved to %s (%d assets)\n", windowsFriendlyPath(siteDir), len(data.siteResources))
 	return nil
 }
 
