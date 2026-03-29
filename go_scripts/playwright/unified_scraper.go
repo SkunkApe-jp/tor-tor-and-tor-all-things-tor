@@ -34,6 +34,7 @@ var (
 	optTargetsFile string
 	optOutputDir   string
 	optLogFile     string
+	optPorts       string // Comma-separated Tor SOCKS ports
 )
 
 // Scraping options
@@ -49,15 +50,18 @@ var (
 	optWorkerCount    int  // Number of parallel workers
 	optFastMode       bool // Fast mode: reduce all stealth delays (inter-site to 5-15s, intra-page to 5-10s)
 	optDepth          int  // Scrape depth (default 1)
+	optSaveClearweb   bool // Save clearweb (non-onion) links
 	optResume         bool // Resume from log (skip already successful onions)
+	optCrossOrigin    bool // Save cross-origin assets (external domains)
 )
 
 type ScrapedData struct {
-	pageTitle   string
-	htmlContent string // Raw HTML
-	screenshot  []byte
-	links       []string
-	titles      map[string]string
+	pageTitle     string
+	htmlContent   string // Raw HTML
+	screenshot    []byte
+	links         []string
+	clearwebLinks []string // Non-onion links
+	titles        map[string]string
 	// Save-as-complete fields
 	siteHTML      string            // Rewritten HTML for offline use
 	siteResources map[string][]byte // original URL -> raw bytes
@@ -68,23 +72,32 @@ func init() {
 	flag.StringVar(&optTargetsFile, "targets", "../targets.yaml", "Path to targets file")
 	flag.StringVar(&optOutputDir, "output", "../scraped_data", "Directory to save results")
 	flag.StringVar(&optLogFile, "log", "../logs/unified_scraper.log", "Path to unified log file")
+	flag.StringVar(&optPorts, "ports", "9050", "Comma-separated Tor SOCKS ports (e.g. 9050,9051,9052)")
 
-	flag.BoolVar(&optScreenshot, "screenshot", false, "Capture full-page screenshots")
-	flag.BoolVar(&optLinks, "links", false, "Extract onion links")
-	flag.BoolVar(&optTitles, "titles", false, "Extract links with titles")
+	flag.BoolVar(&optScreenshot, "screenshot", true, "Capture full-page screenshots")
+	flag.BoolVar(&optLinks, "links", true, "Extract onion links")
+	flag.BoolVar(&optTitles, "titles", true, "Extract links with titles")
 	flag.BoolVar(&optHTML, "html", false, "Download and save full HTML source")
-	flag.BoolVar(&optSaveSite, "save-site", false, "Save page as Webpage Complete (HTML + all assets locally rewritten)")
+	flag.BoolVar(&optSaveSite, "save-site", true, "Save page as Webpage Complete (HTML + all assets locally rewritten)")
 	flag.BoolVar(&optAllowJS, "allow-js", false, "ALLOW dangerous JavaScript to be saved (Risk: Redirects/Tracking)")
 	flag.IntVar(&optInterSiteDelay, "inter-delay", 0, "Inter-site delay: 0=Gaussian 8-15min, or set custom mean (min)")
 	flag.IntVar(&optIntraPageDelay, "intra-delay", 0, "Intra-page reading delay: 0=60-120sec, or set custom (sec)")
 	flag.IntVar(&optWorkerCount, "workers", 1, "Number of parallel workers (default: 1)")
 	flag.BoolVar(&optFastMode, "fast", false, "Fast mode: reduce all stealth delays (inter-site to 5-15s, intra-page to 5-10s)")
 	flag.IntVar(&optDepth, "depth", 1, "Scrape depth (default 1 = single page, 2 = all links on page, etc.)")
-	flag.BoolVar(&optResume, "resume", false, "Resume from processed_targets.log (default: false)")
+	flag.BoolVar(&optSaveClearweb, "clearweb", true, "Save discovered clearweb (non-onion) links")
+	flag.BoolVar(&optResume, "resume", false, "Resume from log (skip already successful onions)")
+	flag.BoolVar(&optCrossOrigin, "cross-origin", true, "Save cross-origin assets from external domains (may be large)")
 }
 
 func main() {
 	flag.Parse()
+
+	// Parse ports
+	ports := parsePorts(optPorts)
+	if len(ports) == 0 {
+		ports = []string{"9050"}
+	}
 
 	// Create output directory if it doesn't exist
 	if err := os.MkdirAll(optOutputDir, 0755); err != nil {
@@ -122,7 +135,7 @@ func main() {
 	}
 
 	fmt.Println("[CHECK] Starting unified scraper v1.2...")
-	fmt.Printf("[CONFIG] Workers: %d | Screenshot: %v | Links: %v | Titles: %v | HTML: %v | SaveSite: %v\n", workers, optScreenshot, optLinks, optTitles, optHTML, optSaveSite)
+	fmt.Printf("[CONFIG] Workers: %d | Ports: %v | Screenshot: %v | Links: %v | Titles: %v | HTML: %v | SaveSite: %v | CrossOrigin: %v\n", workers, ports, optScreenshot, optLinks, optTitles, optHTML, optSaveSite, optCrossOrigin)
 	if optInterSiteDelay == 0 {
 		fmt.Println("[STEALTH] Inter-site delay: Gaussian 8-15 min (human-like)")
 	} else {
@@ -168,12 +181,15 @@ func main() {
 	}
 
 	jobQueue := make(chan ScrapingJob, 5000)
-	var workerWg sync.WaitGroup // tracks worker lifecycle
-	var taskWg sync.WaitGroup   // tracks individual scraping tasks
+	var workerWg sync.WaitGroup
+	var taskWg sync.WaitGroup
+
+	// Rotation counter for port round-robin
+	portCounter := &PortCounter{}
 
 	for i := 1; i <= workers; i++ {
 		workerWg.Add(1)
-		go worker(i, jobQueue, &workerWg, &taskWg)
+		go worker(i, jobQueue, &workerWg, &taskWg, ports, portCounter)
 	}
 
 	for _, u := range targets {
@@ -200,13 +216,37 @@ type ScrapingJob struct {
 	URL   string
 	Depth int
 }
+type PortCounter struct {
+	mu    sync.Mutex
+	count int
+}
+
+func (pc *PortCounter) Next(total int) int {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	idx := pc.count % total
+	pc.count++
+	return idx
+}
+
+func parsePorts(portsStr string) []string {
+	parts := strings.Split(portsStr, ",")
+	var ports []string
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			ports = append(ports, p)
+		}
+	}
+	return ports
+}
 
 var (
 	seenURLs = make(map[string]bool)
 	seenMu   sync.Mutex
 )
 
-func worker(id int, jobs chan ScrapingJob, workerWg *sync.WaitGroup, taskWg *sync.WaitGroup) {
+func worker(id int, jobs chan ScrapingJob, workerWg *sync.WaitGroup, taskWg *sync.WaitGroup, ports []string, portCounter *PortCounter) {
 	defer workerWg.Done()
 
 	pw, err := playwright.Run()
@@ -216,12 +256,11 @@ func worker(id int, jobs chan ScrapingJob, workerWg *sync.WaitGroup, taskWg *syn
 	}
 	defer pw.Stop()
 
+	// Create one browser instance per worker
+	// Each request will use a different port via round-robin
 	browser, err := pw.Firefox.Launch(playwright.BrowserTypeLaunchOptions{
 		Headless: playwright.Bool(true),
-		Proxy: &playwright.Proxy{
-			Server: TorProxyServer,
-		},
-		Args: []string{"--proxy-remote-dns"},
+		Args:     []string{"--proxy-remote-dns"},
 	})
 	if err != nil {
 		fmt.Printf("[THREAD %d] Could not launch firefox: %v\n", id, err)
@@ -233,6 +272,11 @@ func worker(id int, jobs chan ScrapingJob, workerWg *sync.WaitGroup, taskWg *syn
 		targetURL := job.URL
 		currentDepth := job.Depth
 
+		// Ensure URL has a protocol scheme (only for clearweb, not onion)
+		if !strings.HasPrefix(targetURL, "http://") && !strings.HasPrefix(targetURL, "https://") && !strings.Contains(targetURL, ".onion") {
+			targetURL = "https://" + targetURL
+		}
+
 		// Global seen check to avoid loops
 		seenMu.Lock()
 		if seenURLs[targetURL] {
@@ -243,15 +287,21 @@ func worker(id int, jobs chan ScrapingJob, workerWg *sync.WaitGroup, taskWg *syn
 		seenURLs[targetURL] = true
 		seenMu.Unlock()
 
+		// Select port via round-robin
+		portIdx := portCounter.Next(len(ports))
+		selectedPort := ports[portIdx]
+		proxyServer := fmt.Sprintf("socks5://127.0.0.1:%s", selectedPort)
+
 		// Inter-site delay with Gaussian distribution (human-like)
 		delay := getInterSiteDelay()
-		fmt.Printf("\n[THREAD %d] (Depth %d) Waiting %v for %s\n", id, currentDepth, delay, targetURL)
+		fmt.Printf("\n[THREAD %d] (Depth %d) [Port %s] Waiting %v for %s\n", id, currentDepth, selectedPort, delay, targetURL)
 		time.Sleep(delay)
 
-		data, err := processURL(browser, targetURL)
+		data, err := processURL(browser, targetURL, proxyServer)
 		if err != nil {
 			fmt.Printf("[ERROR] [%s]: %v\n", targetURL, err)
 			appendLog(targetURL, "FAIL", err.Error(), nil)
+			taskWg.Done()
 			continue
 		}
 
@@ -324,6 +374,15 @@ func worker(id int, jobs chan ScrapingJob, workerWg *sync.WaitGroup, taskWg *syn
 			}
 		}
 
+		// Save clearweb links
+		if optSaveClearweb && len(data.clearwebLinks) > 0 {
+			if err := saveClearwebLinks(onionAddr, targetURL, data.clearwebLinks); err != nil {
+				fmt.Printf("[ERROR] Saving clearweb links [%s]: %v\n", targetURL, err)
+			} else {
+				fmt.Printf("[OK] Clearweb links saved: %s (%d links)\n", onionAddr, len(data.clearwebLinks))
+			}
+		}
+
 		// Save main page title
 		if optTitles && data.pageTitle != "" {
 			if err := saveMainPageTitle(onionAddr, targetURL, data.pageTitle); err != nil {
@@ -348,11 +407,14 @@ func worker(id int, jobs chan ScrapingJob, workerWg *sync.WaitGroup, taskWg *syn
 	}
 }
 
-func processURL(browser playwright.Browser, fullURL string) (*ScrapedData, error) {
+func processURL(browser playwright.Browser, fullURL string, proxyServer string) (*ScrapedData, error) {
 	context, err := browser.NewContext(playwright.BrowserNewContextOptions{
 		UserAgent:         playwright.String(TorUA),
 		Viewport:          &playwright.Size{Width: 1400, Height: 900},
 		IgnoreHttpsErrors: playwright.Bool(true),
+		Proxy: &playwright.Proxy{
+			Server: proxyServer,
+		},
 		ExtraHttpHeaders: map[string]string{
 			"Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 			"Accept-Language": "en-US,en;q=0.5",
@@ -451,12 +513,23 @@ func processURL(browser playwright.Browser, fullURL string) (*ScrapedData, error
 			}
 			if optSaveSite {
 				// --- PROACTIVE ASSET DISCOVERY (Parallelized) ---
-				extensions := "png|jpg|jpeg|gif|ico|svg|css|xml|json|woff2?|ttf|otf|bin|pdf|epub|mobi|azw|mp3|mp4|zip|rar"
+				// Video: mp4, webm, mkv, mov, m4v, avi, flv, wmv, mpg/mpeg, ogv, 3gp/3g2, ts, m3u8 (HLS), f4v, rm/rmvb, divx, xvid, asf, vob
+				// Audio: mp3, ogg, opus, aac, flac, wav, wma, m4a, aiff, aif, alac
+				// Docs/Archives/Fonts/Images as before
+				extensions := "png|jpg|jpeg|gif|ico|svg|css|xml|json|woff2?|ttf|otf|bin|pdf|epub|mobi|azw|zip|rar|webp|avif|" +
+					"mp4|webm|mkv|mov|m4v|avi|flv|wmv|mpg|mpeg|ogv|3gp|3g2|ts|m3u8|m3u|f4v|rm|rmvb|divx|xvid|asf|vob|" +
+					"mp3|ogg|opus|aac|flac|wav|wma|m4a|aiff|aif|alac"
 				if optAllowJS {
 					extensions += "|js"
 				}
-				assetRegex := regexp.MustCompile(`(?i)(?:src|href|url)=['"]([^'"]+\.(?:` + extensions + `))(?:\?[^'"]*)?['"]`)
+				// Match src, href, url(), data-src, data-lazy-src, data-original
+				assetRegex := regexp.MustCompile(`(?i)(?:src|href|data-src|data-lazy-src|data-original)=['"]([^'"]+\.(?:` + extensions + `))(?:\?[^'"]*)?['"]`)
 				potentialAssets := assetRegex.FindAllStringSubmatch(html, -1)
+
+				// Also find CSS background images: url('...') or url("...")
+				bgRegex := regexp.MustCompile(`(?i)url\(['"]?([^'"]+\.(?:` + extensions + `))(?:\?[^'"]*)?['"]?\)`)
+				bgAssets := bgRegex.FindAllStringSubmatch(html, -1)
+				potentialAssets = append(potentialAssets, bgAssets...)
 
 				baseURLParsed, _ := url.Parse(fullURL)
 
@@ -499,8 +572,9 @@ func processURL(browser playwright.Browser, fullURL string) (*ScrapedData, error
 							_, alreadyCaptured := capturedResources[assetURL]
 							resMu.Unlock()
 
+							// Check if asset is from same host or if cross-origin is enabled
 							isAssetSameHost := assetURLObj.Host == baseURLParsed.Host || strings.HasSuffix(assetURLObj.Host, "."+baseURLParsed.Host) || assetURLObj.Host == ""
-							if !alreadyCaptured && isAssetSameHost {
+							if !alreadyCaptured && (isAssetSameHost || optCrossOrigin) {
 								time.Sleep(100 * time.Millisecond) // Protective delay
 
 								// Use browser evaluation to fetch the resource
@@ -545,8 +619,13 @@ func processURL(browser playwright.Browser, fullURL string) (*ScrapedData, error
 				// Build filename map and rewrite HTML
 				data.siteResources = capturedResources
 				data.siteFilenames = make(map[string]string)
+				parsedURL, _ := url.Parse(fullURL)
+				baseHost := ""
+				if parsedURL != nil {
+					baseHost = parsedURL.Host
+				}
 				for resURL := range capturedResources {
-					local := resourceRelativePath(resURL)
+					local := resourceRelativePath(resURL, baseHost)
 					data.siteFilenames[resURL] = local
 				}
 				data.siteFilenames[fullURL] = "index.html"
@@ -576,17 +655,25 @@ func processURL(browser playwright.Browser, fullURL string) (*ScrapedData, error
 			return nil, err
 		}
 
+		// Extract onion links
 		onionRegex := regexp.MustCompile(`https?://[a-z2-7]{56}\.onion[^\s"']*`)
-		seenLinks := make(map[string]bool)
+		seenOnionLinks := make(map[string]bool)
+		// Extract clearweb links (all other http/https URLs)
+		clearwebRegex := regexp.MustCompile(`https?://[a-zA-Z0-9][-a-zA-Z0-9]*\.[a-zA-Z]{2,}[^\s"']*`)
+		seenClearwebLinks := make(map[string]bool)
 
 		if linkObjects, ok := rawLinks.([]interface{}); ok {
 			for _, obj := range linkObjects {
-				entry := obj.(map[string]interface{})
+				entry, ok := obj.(map[string]interface{})
+				if !ok {
+					continue
+				}
 				linkStr := fmt.Sprintf("%v", entry["href"])
 				titleStr := strings.TrimSpace(fmt.Sprintf("%v", entry["text"]))
 
-				if onionRegex.MatchString(linkStr) && !seenLinks[linkStr] {
-					seenLinks[linkStr] = true
+				// Check if it's an onion link
+				if onionRegex.MatchString(linkStr) && !seenOnionLinks[linkStr] {
+					seenOnionLinks[linkStr] = true
 					data.links = append(data.links, linkStr)
 
 					if optTitles {
@@ -596,6 +683,13 @@ func processURL(browser playwright.Browser, fullURL string) (*ScrapedData, error
 						titleStr = strings.ReplaceAll(titleStr, "\n", " ")
 						data.titles[linkStr] = titleStr
 					}
+				} else if optSaveClearweb && clearwebRegex.MatchString(linkStr) && !seenClearwebLinks[linkStr] {
+					// It's a clearweb link and we're saving those
+					seenClearwebLinks[linkStr] = true
+					if data.clearwebLinks == nil {
+						data.clearwebLinks = []string{}
+					}
+					data.clearwebLinks = append(data.clearwebLinks, linkStr)
 				}
 			}
 		}
@@ -605,7 +699,8 @@ func processURL(browser playwright.Browser, fullURL string) (*ScrapedData, error
 }
 
 // resourceRelativePath generates a local path that preserves the original URL's directory structure.
-func resourceRelativePath(resURL string) string {
+// For cross-origin assets, includes the hostname as a prefix to avoid conflicts.
+func resourceRelativePath(resURL string, baseHost string) string {
 	u, err := url.Parse(resURL)
 	if err != nil {
 		return "resource_bin.bin"
@@ -614,7 +709,12 @@ func resourceRelativePath(resURL string) string {
 	// Preserve full directory structure (e.g. static/images/...)
 	cleanPath := strings.TrimLeft(u.Path, "/")
 	if cleanPath == "" {
-		return "root_resource.bin"
+		cleanPath = "root_resource.bin"
+	}
+
+	// For cross-origin assets, prefix with hostname to avoid conflicts
+	if u.Host != "" && u.Host != baseHost && !strings.HasSuffix(u.Host, "."+baseHost) {
+		cleanPath = u.Host + "/" + cleanPath
 	}
 
 	// Sanitise individual components while keeping hierarchical structure
@@ -675,24 +775,26 @@ func rewriteHTML(html string, baseURL string, filenameMap map[string]string) str
 
 		// 1. Root-relative paths and Sub-domain paths
 		isSameHost := targetURL.Host == base.Host || strings.HasSuffix(targetURL.Host, "."+base.Host) || targetURL.Host == ""
-		if isSameHost {
+		if isSameHost || optCrossOrigin {
 			matches = append(matches, targetURL.Path)
 			if targetURL.RawQuery != "" {
 				matches = append(matches, targetURL.Path+"?"+targetURL.RawQuery)
 			}
 
-			// 2. Relative paths (same-folder)
-			baseDir := path.Dir(base.Path)
-			if baseDir == "." {
-				baseDir = "/"
-			}
-			if strings.HasPrefix(targetURL.Path, baseDir) {
-				rel := strings.TrimPrefix(targetURL.Path, baseDir)
-				rel = strings.TrimPrefix(rel, "/")
-				if rel != "" {
-					matches = append(matches, rel)
-					if targetURL.RawQuery != "" {
-						matches = append(matches, rel+"?"+targetURL.RawQuery)
+			// 2. Relative paths (same-folder) - only for same host
+			if isSameHost {
+				baseDir := path.Dir(base.Path)
+				if baseDir == "." {
+					baseDir = "/"
+				}
+				if strings.HasPrefix(targetURL.Path, baseDir) {
+					rel := strings.TrimPrefix(targetURL.Path, baseDir)
+					rel = strings.TrimPrefix(rel, "/")
+					if rel != "" {
+						matches = append(matches, rel)
+						if targetURL.RawQuery != "" {
+							matches = append(matches, rel+"?"+targetURL.RawQuery)
+						}
 					}
 				}
 			}
@@ -720,6 +822,29 @@ func rewriteHTML(html string, baseURL string, filenameMap map[string]string) str
 	// Execute all replacements in a single O(N) pass
 	replacer := strings.NewReplacer(replaces...)
 	html = replacer.Replace(html)
+
+	// --- FIX LAZY-LOADED IMAGES ---
+	// Replace data-src and data-srcset attributes that still point to external URLs
+	for origURL, localName := range filenameMap {
+		if localName == "index.html" {
+			continue
+		}
+		localRef := "../_assets/" + localName
+
+		// Replace data-src="origURL"
+		dataSrcPattern := regexp.MustCompile(`(?i)data-src=["']` + regexp.QuoteMeta(origURL) + `["']`)
+		html = dataSrcPattern.ReplaceAllString(html, `src="`+localRef+`" data-src="`+localRef+`"`)
+
+		// Replace data-srcset containing origURL
+		dataSrcsetPattern := regexp.MustCompile(`(?i)data-srcset=["'][^"']*` + regexp.QuoteMeta(origURL) + `[^"']*["']`)
+		html = dataSrcsetPattern.ReplaceAllStringFunc(html, func(match string) string {
+			// Replace the URL within the srcset value
+			newMatch := strings.Replace(match, origURL, localRef, -1)
+			// Also change data-srcset to srcset so it loads immediately
+			newMatch = regexp.MustCompile(`(?i)data-srcset`).ReplaceAllString(newMatch, "srcset")
+			return newMatch
+		})
+	}
 
 	// Neutralize <base> tags to fix local relative resolution
 	reBase := regexp.MustCompile(`(?i)<base\s+[^>]*>`)
@@ -838,6 +963,21 @@ func saveTitles(onionAddr, fullURL string, titles map[string]string) error {
 	}
 
 	return os.WriteFile(filePath, []byte(strings.Join(lines, "\n")), 0644)
+}
+
+func saveClearwebLinks(onionAddr, fullURL string, links []string) error {
+	if len(links) == 0 {
+		return nil
+	}
+
+	linkDir := filepath.Join(optOutputDir, onionAddr, "discovered_links")
+	if err := os.MkdirAll(linkDir, 0755); err != nil {
+		return err
+	}
+
+	filename := generateFilenameForFile(fullURL)
+	filePath := filepath.Join(linkDir, filename+"_clearweb_links.txt")
+	return os.WriteFile(filePath, []byte(strings.Join(links, "\n")), 0644)
 }
 
 func saveMainPageTitle(onionAddr, fullURL string, pageTitle string) error {
@@ -1036,14 +1176,28 @@ func appendLog(url, status, msg string, data *ScrapedData) {
 }
 
 func extractOnionAddress(fullURL string) string {
-	// Capture the full hostname including sub-domains (e.g. sub.addr.onion)
+	// First try to find onion address
 	re := regexp.MustCompile(`([a-z0-9.-]+\.onion)`)
 	matches := re.FindStringSubmatch(fullURL)
 	if len(matches) > 1 {
-		// Return the domain without the .onion suffix for cleaner folder names if desired,
-		// but keeping the full string before .onion is safer for uniqueness.
 		return strings.TrimSuffix(matches[1], ".onion")
 	}
+
+	// For clearweb URLs, extract the hostname
+	u, err := url.Parse(fullURL)
+	if err == nil && u.Host != "" {
+		host := strings.ToLower(u.Host)
+		// Remove port if present
+		if colonIdx := strings.LastIndex(host, ":"); colonIdx != -1 {
+			host = host[:colonIdx]
+		}
+		// Remove www. prefix for cleaner folder names
+		host = strings.TrimPrefix(host, "www.")
+		if host != "" {
+			return host
+		}
+	}
+
 	return "unknown"
 }
 
