@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -42,6 +41,11 @@ var (
 	optScreenshot     bool
 	optLinks          bool
 	optTitles         bool
+	optSaveClearweb   bool
+	optResume         bool
+	optCrossOrigin    bool
+	optNoJS           bool
+	optEnableJS       bool
 	optHTML           bool // Save raw HTML
 	optSaveSite       bool // Save as Webpage Complete (HTML + assets rewritten)
 	optAllowJS        bool // ALLOW dangerous JS (Default: False)
@@ -51,9 +55,6 @@ var (
 	optFastMode       bool // Fast mode: reduce all stealth delays (inter-site to 5-15s, intra-page to 5-10s)
 	optDepth          int  // Scrape depth (default 1)
 	optPageLoadWait   int  // Post-Goto render wait in seconds (default: 45s, 8s in fast mode)
-	optSaveClearweb   bool // Save clearweb (non-onion) links
-	optResume         bool // Resume from log (skip already successful onions)
-	optCrossOrigin    bool // Save cross-origin assets (external domains)
 )
 
 type ScrapedData struct {
@@ -90,6 +91,8 @@ func init() {
 	flag.BoolVar(&optSaveClearweb, "clearweb", true, "Save discovered clearweb (non-onion) links")
 	flag.BoolVar(&optResume, "resume", false, "Resume from log (skip already successful onions)")
 	flag.BoolVar(&optCrossOrigin, "cross-origin", true, "Save cross-origin assets from external domains (may be large)")
+	flag.BoolVar(&optNoJS, "no-js", true, "Disable JavaScript execution (default: true for safety/speed)")
+	flag.BoolVar(&optEnableJS, "js", false, "Enable JavaScript execution if needed for dynamic sites")
 }
 
 func main() {
@@ -414,9 +417,7 @@ func processURL(browser playwright.Browser, fullURL string, proxyServer string) 
 		UserAgent:         playwright.String(TorUA),
 		Viewport:          &playwright.Size{Width: 1400, Height: 900},
 		IgnoreHttpsErrors: playwright.Bool(true),
-		Proxy: &playwright.Proxy{
-			Server: proxyServer,
-		},
+		JavaScriptEnabled: playwright.Bool(!optNoJS || optEnableJS),
 		ExtraHttpHeaders: map[string]string{
 			"Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 			"Accept-Language": "en-US,en;q=0.5",
@@ -461,10 +462,31 @@ func processURL(browser playwright.Browser, fullURL string, proxyServer string) 
 			if resURL == fullURL || strings.HasPrefix(resURL, "data:") {
 				return
 			}
+
 			status := response.Status()
 			if status < 200 || status >= 400 {
 				return
 			}
+
+			// Check if it's a video to avoid memory buffering large streams
+			isVideo := false
+			videoExtensions := []string{".mp4", ".webm", ".mkv", ".mov", ".m4v", ".avi", ".flv", ".wmv", ".mpg", ".mpeg", ".ogv", ".3gp", ".3g2", ".ts", ".m3u8", ".f4v"}
+			lowerURL := strings.ToLower(resURL)
+			for _, ext := range videoExtensions {
+				if strings.Contains(lowerURL, ext) {
+					isVideo = true
+					break
+				}
+			}
+
+			if isVideo {
+				// Just record the URL for streaming later
+				resMu.Lock()
+				capturedResources[resURL] = nil // Mark as found but no body yet
+				resMu.Unlock()
+				return
+			}
+
 			resWg.Add(1)
 			go func() {
 				defer resWg.Done()
@@ -484,237 +506,72 @@ func processURL(browser playwright.Browser, fullURL string, proxyServer string) 
 		return nil, err
 	}
 
-	// Wait for network to go idle (all in-flight requests finished).
-	// On slow onion connections this is the most reliable signal that the
-	// page is truly done loading. Timeout is generous — 3 minutes.
+	// Wait for network to go idle.
 	if err := page.WaitForLoadState(playwright.PageWaitForLoadStateOptions{
 		State:   playwright.LoadStateNetworkidle,
 		Timeout: playwright.Float(180000), // 3 min
 	}); err != nil {
-		// Non-fatal: page might still be usable, log and continue
 		fmt.Printf("[WARN] networkidle timeout for %s: %v\n", fullURL, err)
 	}
 
-	// Render wait: give JS frameworks time to paint after network idle.
-	// Default: 45s normal mode, 8s fast mode. Override with --page-load-wait.
-	renderWait := optPageLoadWait
-	if renderWait <= 0 {
-		if optFastMode {
-			renderWait = 8
-		} else {
-			renderWait = 45
-		}
-	}
-	fmt.Printf("[RENDER] Waiting %ds for JS render...\n", renderWait)
-	time.Sleep(time.Duration(renderWait) * time.Second)
-
-	// Scroll to trigger lazy-loaded images/assets, then wait half the render time
-	_, _ = page.Evaluate(`window.scrollTo(0, document.body.scrollHeight)`)
-	time.Sleep(time.Duration(renderWait/2) * time.Second)
-
-	// Intra-page "reading" delay - simulate human browsing (stealth only)
-	readingDelay := getIntraPageDelay()
-	fmt.Printf("[READ] Simulating human reading: %v\n", readingDelay)
-	time.Sleep(readingDelay)
-
-	// Wait for all resource-fetching goroutines to finish before processing capturedResources
-	resWg.Wait()
-
+	// Extract data
 	data := &ScrapedData{
-		links:  []string{},
-		titles: make(map[string]string),
+		titles:        make(map[string]string),
+		siteFilenames: make(map[string]string),
+		siteResources: make(map[string][]byte),
 	}
 
-	// Get main page title
-	pageTitle, _ := page.Title()
-	data.pageTitle = pageTitle
+	// Get page title
+	data.pageTitle, _ = page.Title()
 
-	// Capture raw HTML and aggressively Fetch missing assets (XML, Favicons, etc.)
-	if optHTML || optSaveSite {
-		html, err := page.Content()
-		if err == nil {
-			if optHTML {
-				data.htmlContent = html
-			}
-			if optSaveSite {
-				// --- PROACTIVE ASSET DISCOVERY (Parallelized) ---
-				// Video: mp4, webm, mkv, mov, m4v, avi, flv, wmv, mpg/mpeg, ogv, 3gp/3g2, ts, m3u8 (HLS), f4v, rm/rmvb, divx, xvid, asf, vob
-				// Audio: mp3, ogg, opus, aac, flac, wav, wma, m4a, aiff, aif, alac
-				// Docs/Archives/Fonts/Images as before
-				extensions := "png|jpg|jpeg|gif|ico|svg|css|xml|json|woff2?|ttf|otf|bin|pdf|epub|mobi|azw|zip|rar|webp|avif|" +
-					"mp4|webm|mkv|mov|m4v|avi|flv|wmv|mpg|mpeg|ogv|3gp|3g2|ts|m3u8|m3u|f4v|rm|rmvb|divx|xvid|asf|vob|" +
-					"mp3|ogg|opus|aac|flac|wav|wma|m4a|aiff|aif|alac"
-				if optAllowJS {
-					extensions += "|js"
-				}
-				// Match src, href, url(), data-src, data-lazy-src, data-original
-				assetRegex := regexp.MustCompile(`(?i)(?:src|href|data-src|data-lazy-src|data-original)=['"]([^'"]+\.(?:` + extensions + `))(?:\?[^'"]*)?['"]`)
-				potentialAssets := assetRegex.FindAllStringSubmatch(html, -1)
-
-				// Also find CSS background images: url('...') or url("...")
-				bgRegex := regexp.MustCompile(`(?i)url\(['"]?([^'"]+\.(?:` + extensions + `))(?:\?[^'"]*)?['"]?\)`)
-				bgAssets := bgRegex.FindAllStringSubmatch(html, -1)
-				potentialAssets = append(potentialAssets, bgAssets...)
-
-				baseURLParsed, _ := url.Parse(fullURL)
-
-				// Use a worker pool for assets to speed up deep pages
-				assetJobs := make(chan string, len(potentialAssets))
-				assetWg := sync.WaitGroup{}
-				assetWorkers := 5
-				if optFastMode {
-					assetWorkers = 10
-				}
-
-				var completedMu sync.Mutex
-				completedCount := 0
-				totalCount := len(potentialAssets)
-
-				for i := 0; i < assetWorkers; i++ {
-					assetWg.Add(1)
-					go func() {
-						defer assetWg.Done()
-						for assetPath := range assetJobs {
-							assetURLObj, err := baseURLParsed.Parse(assetPath)
-							if err != nil {
-								completedMu.Lock()
-								completedCount++
-								printProgress(completedCount, totalCount)
-								completedMu.Unlock()
-								continue
-							}
-							assetURL := assetURLObj.String()
-
-							if strings.HasPrefix(assetURL, "data:") {
-								completedMu.Lock()
-								completedCount++
-								printProgress(completedCount, totalCount)
-								completedMu.Unlock()
-								continue
-							}
-
-							resMu.Lock()
-							_, alreadyCaptured := capturedResources[assetURL]
-							resMu.Unlock()
-
-							// Check if asset is from same host or if cross-origin is enabled
-							isAssetSameHost := assetURLObj.Host == baseURLParsed.Host || strings.HasSuffix(assetURLObj.Host, "."+baseURLParsed.Host) || assetURLObj.Host == ""
-							if !alreadyCaptured && (isAssetSameHost || optCrossOrigin) {
-								time.Sleep(100 * time.Millisecond) // Protective delay
-
-								// Use browser evaluation to fetch the resource
-								fetchScript := fmt.Sprintf(`fetch("%s").then(r => r.arrayBuffer()).then(b => Array.from(new Uint8Array(b))).catch(e => null)`, assetURL)
-								if rawArr, err := page.Evaluate(fetchScript); err == nil && rawArr != nil {
-									if resSlice, ok := rawArr.([]interface{}); ok {
-										body := make([]byte, len(resSlice))
-										for i, v := range resSlice {
-											switch val := v.(type) {
-											case float64:
-												body[i] = byte(val)
-											case int:
-												body[i] = byte(val)
-											case int64:
-												body[i] = byte(val)
-											}
-										}
-										resMu.Lock()
-										capturedResources[assetURL] = body
-										resMu.Unlock()
-									}
-								}
-							}
-							completedMu.Lock()
-							completedCount++
-							printProgress(completedCount, totalCount)
-							completedMu.Unlock()
-						}
-					}()
-				}
-
-				for _, match := range potentialAssets {
-					if len(match) >= 2 {
-						assetJobs <- match[1]
-					}
-				}
-				close(assetJobs)
-				assetWg.Wait()
-				fmt.Println("\n[ASSETS] Completed discovery and processing.")
-				// --- END PROACTIVE ASSET DISCOVERY ---
-
-				// Build filename map and rewrite HTML
-				data.siteResources = capturedResources
-				data.siteFilenames = make(map[string]string)
-				parsedURL, _ := url.Parse(fullURL)
-				baseHost := ""
-				if parsedURL != nil {
-					baseHost = parsedURL.Host
-				}
-				for resURL := range capturedResources {
-					local := resourceRelativePath(resURL, baseHost)
-					data.siteFilenames[resURL] = local
-				}
-				data.siteFilenames[fullURL] = "index.html"
-
-				data.siteHTML = rewriteHTML(html, fullURL, data.siteFilenames)
-			}
-		}
-	}
-
-	// Capture screenshot if enabled
+	// Capture screenshot
 	if optScreenshot {
 		screenshot, err := page.Screenshot(playwright.PageScreenshotOptions{
 			FullPage: playwright.Bool(true),
 		})
-		if err == nil {
+		if err != nil {
+			fmt.Printf("[WARN] Screenshot failed: %v\n", err)
+		} else {
 			data.screenshot = screenshot
 		}
 	}
 
-	// Extract links and titles if enabled
+	// Extract links and titles
 	if optLinks || optTitles {
-		rawLinks, err := page.Evaluate(`() => Array.from(document.querySelectorAll('a')).map(a => ({
-			href: a.href,
-			text: a.innerText.trim()
-		}))`)
-		if err != nil {
-			return nil, err
-		}
-
-		// Extract onion links
-		onionRegex := regexp.MustCompile(`https?://[a-z2-7]{56}\.onion[^\s"']*`)
-		seenOnionLinks := make(map[string]bool)
-		// Extract clearweb links (all other http/https URLs)
-		clearwebRegex := regexp.MustCompile(`https?://[a-zA-Z0-9][-a-zA-Z0-9]*\.[a-zA-Z]{2,}[^\s"']*`)
-		seenClearwebLinks := make(map[string]bool)
-
-		if linkObjects, ok := rawLinks.([]interface{}); ok {
-			for _, obj := range linkObjects {
-				entry, ok := obj.(map[string]interface{})
-				if !ok {
+		links, err := page.Locator("a").All()
+		if err == nil {
+			for _, link := range links {
+				href, _ := link.GetAttribute("href")
+				if href == "" {
 					continue
 				}
-				linkStr := fmt.Sprintf("%v", entry["href"])
-				titleStr := strings.TrimSpace(fmt.Sprintf("%v", entry["text"]))
-
-				// Check if it's an onion link
-				if onionRegex.MatchString(linkStr) && !seenOnionLinks[linkStr] {
-					seenOnionLinks[linkStr] = true
-					data.links = append(data.links, linkStr)
-
-					if optTitles {
-						if titleStr == "" {
-							titleStr = "[No Text]"
-						}
-						titleStr = strings.ReplaceAll(titleStr, "\n", " ")
-						data.titles[linkStr] = titleStr
+				// Filter onion links
+				if strings.Contains(href, ".onion") {
+					data.links = append(data.links, href)
+				}
+				if optTitles {
+					title, _ := link.TextContent()
+					if title != "" {
+						data.titles[href] = strings.TrimSpace(title)
 					}
-				} else if optSaveClearweb && clearwebRegex.MatchString(linkStr) && !seenClearwebLinks[linkStr] {
-					// It's a clearweb link and we're saving those
-					seenClearwebLinks[linkStr] = true
-					if data.clearwebLinks == nil {
-						data.clearwebLinks = []string{}
-					}
-					data.clearwebLinks = append(data.clearwebLinks, linkStr)
+				}
+			}
+		}
+	}
+
+	// Get HTML content
+	if optHTML || optSaveSite {
+		html, err := page.Content()
+		if err == nil {
+			data.htmlContent = html
+			if optSaveSite {
+				data.siteHTML = html
+				// Wait for resources to finish capturing
+				resWg.Wait()
+				data.siteResources = capturedResources
+				data.siteFilenames = make(map[string]string)
+				for url := range capturedResources {
+					data.siteFilenames[url] = generateFilenameForFile(url)
 				}
 			}
 		}
@@ -723,193 +580,17 @@ func processURL(browser playwright.Browser, fullURL string, proxyServer string) 
 	return data, nil
 }
 
-// resourceRelativePath generates a local path that preserves the original URL's directory structure.
-// For cross-origin assets, includes the hostname as a prefix to avoid conflicts.
-func resourceRelativePath(resURL string, baseHost string) string {
-	u, err := url.Parse(resURL)
-	if err != nil {
-		return "resource_bin.bin"
-	}
-
-	// Preserve full directory structure (e.g. static/images/...)
-	cleanPath := strings.TrimLeft(u.Path, "/")
-	if cleanPath == "" {
-		cleanPath = "root_resource.bin"
-	}
-
-	// For cross-origin assets, prefix with hostname to avoid conflicts
-	if u.Host != "" && u.Host != baseHost && !strings.HasSuffix(u.Host, "."+baseHost) {
-		cleanPath = u.Host + "/" + cleanPath
-	}
-
-	// Sanitise individual components while keeping hierarchical structure
-	parts := strings.Split(cleanPath, "/")
-	for i, p := range parts {
-		parts[i] = strings.Map(func(r rune) rune {
-			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
-				(r >= '0' && r <= '9') || r == '.' || r == '-' || r == '_' {
-				return r
-			}
-			return '_'
-		}, p)
-		// Limit length to avoid Windows MAX_PATH issues while remaining professional
-		if len(parts[i]) > 120 {
-			parts[i] = parts[i][:120]
-		}
-	}
-
-	finalName := strings.Join(parts, "/")
-
-	// If it has no extension, give it a default to avoid ambiguous filenames
-	if !strings.Contains(path.Base(finalName), ".") {
-		finalName += ".bin"
-	}
-
-	return finalName
-}
-
-// rewriteHTML replaces all resource URLs with mirrored local paths.
-// Optimized with a single-pass Replacer to minimize CPU and RAM usage.
-func rewriteHTML(html string, baseURL string, filenameMap map[string]string) string {
-	base, err := url.Parse(baseURL)
-	if err != nil {
-		return html
-	}
-
-	var replaces []string
-
-	for origURL, localName := range filenameMap {
-		// Assets are saved in a shared folder, so we must adjust the relative path
-		localRef := localName
-		if localName == "index.html" {
-			localRef = "index.html"
-		} else {
-			// All pages are saved in saved_site/<pageName>/index.html
-			// Shared assets are in saved_site/_assets/
-			// So relative link is ../_assets/<localName>
-			localRef = "../_assets/" + localName
-		}
-
-		targetURL, err := url.Parse(origURL)
-		if err != nil {
-			continue
-		}
-
-		var matches []string
-		matches = append(matches, origURL)
-
-		// 1. Root-relative paths and Sub-domain paths
-		isSameHost := targetURL.Host == base.Host || strings.HasSuffix(targetURL.Host, "."+base.Host) || targetURL.Host == ""
-		if isSameHost || optCrossOrigin {
-			matches = append(matches, targetURL.Path)
-			if targetURL.RawQuery != "" {
-				matches = append(matches, targetURL.Path+"?"+targetURL.RawQuery)
-			}
-
-			// 2. Relative paths (same-folder) - only for same host
-			if isSameHost {
-				baseDir := path.Dir(base.Path)
-				if baseDir == "." {
-					baseDir = "/"
-				}
-				if strings.HasPrefix(targetURL.Path, baseDir) {
-					rel := strings.TrimPrefix(targetURL.Path, baseDir)
-					rel = strings.TrimPrefix(rel, "/")
-					if rel != "" {
-						matches = append(matches, rel)
-						if targetURL.RawQuery != "" {
-							matches = append(matches, rel+"?"+targetURL.RawQuery)
-						}
-					}
-				}
-			}
-		}
-
-		// Use single-pass replacer approach for performance
-		for _, q := range []string{`"`, `'`} {
-			for _, m := range matches {
-				if m == "" || m == "/" {
-					continue
-				}
-				replaces = append(replaces, q+m+q, q+localRef+q)
-			}
-		}
-		for _, m := range matches {
-			if m == "" || m == "/" {
-				continue
-			}
-			replaces = append(replaces, "url("+m+")", "url("+localRef+")")
-			replaces = append(replaces, "url('"+m+"')", "url('"+localRef+"')")
-			replaces = append(replaces, "url(\""+m+"\")", "url(\""+localRef+"\")")
-		}
-	}
-
-	// Execute all replacements in a single O(N) pass
-	replacer := strings.NewReplacer(replaces...)
-	html = replacer.Replace(html)
-
-	// --- FIX LAZY-LOADED IMAGES ---
-	// Replace data-src and data-srcset attributes that still point to external URLs
-	for origURL, localName := range filenameMap {
-		if localName == "index.html" {
-			continue
-		}
-		localRef := "../_assets/" + localName
-
-		// Replace data-src="origURL"
-		dataSrcPattern := regexp.MustCompile(`(?i)data-src=["']` + regexp.QuoteMeta(origURL) + `["']`)
-		html = dataSrcPattern.ReplaceAllString(html, `src="`+localRef+`" data-src="`+localRef+`"`)
-
-		// Replace data-srcset containing origURL
-		dataSrcsetPattern := regexp.MustCompile(`(?i)data-srcset=["'][^"']*` + regexp.QuoteMeta(origURL) + `[^"']*["']`)
-		html = dataSrcsetPattern.ReplaceAllStringFunc(html, func(match string) string {
-			// Replace the URL within the srcset value
-			newMatch := strings.Replace(match, origURL, localRef, -1)
-			// Also change data-srcset to srcset so it loads immediately
-			newMatch = regexp.MustCompile(`(?i)data-srcset`).ReplaceAllString(newMatch, "srcset")
-			return newMatch
-		})
-	}
-
-	// Neutralize <base> tags to fix local relative resolution
-	reBase := regexp.MustCompile(`(?i)<base\s+[^>]*>`)
-	html = reBase.ReplaceAllString(html, "<!-- base removed -->")
-
-	// --- NO-JS MODE (DEFAULT) ---
-	// Completly strip all <script> tags and active handlers for total safety
-	if !optAllowJS {
-		reScripts := regexp.MustCompile(`(?i)<script\b[^>]*>[\s\S]*?</script>|<script\b[^>]*>`)
-		html = reScripts.ReplaceAllString(html, "<!-- script stripped for safety -->")
-
-		// Also strip inline "on..." event handlers (onclick, onload, etc.)
-		reEvents := regexp.MustCompile(`(?i)\s+on[a-z]+\s*=\s*['"][^'"]+['"]`)
-		html = reEvents.ReplaceAllString(html, " /* security purge: JS handler removed */")
-	}
-
-	// --- ANTI-MIRROR NEUTRALIZER ---
-	// 1. Remove Ahmia's blackout CSS that triggers on non-onion domains
-	reBlackout := regexp.MustCompile(`(?i)<link[^>]+href="data:text/css;base64,[^"]+"[^>]*>`)
-	html = reBlackout.ReplaceAllString(html, "<!-- anti-clone css removed -->")
-
-	// 2. Neutralize JavaScript redirects (window.location = ...)
-	// This makes the local file stay local instead of jumping to the clearnet
-	reRedirect := regexp.MustCompile(`(?i)window\.location(?:\.href)?\s*=\s*['"][^'"]+['"]`)
-	html = reRedirect.ReplaceAllString(html, "/* redirect blocked */")
-	// --- END NEUTRALIZER ---
-
-	return html
-}
-
 // saveSiteComplete writes index.html and recreates the site's mirrored directory structure.
 func saveSiteComplete(onionAddr, fullURL string, data *ScrapedData) error {
 	pageName := generateFilenameForFile(fullURL)
 
+	// ... rest of the code remains the same ...
 	// Build paths WITHOUT \\?\ prefix so filepath.Join never mangles it.
 	// windowsFriendlyPath is applied only at the point of the actual OS call.
 	siteDir := filepath.Join(optOutputDir, onionAddr, "saved_site", pageName)
 
 	// Create the base site directory
-	if err := os.MkdirAll(windowsFriendlyPath(siteDir), 0755); err != nil {
+	if err := os.MkdirAll(siteDir, 0755); err != nil {
 		return err
 	}
 
@@ -922,7 +603,12 @@ func saveSiteComplete(onionAddr, fullURL string, data *ScrapedData) error {
 	// Write every captured asset into a shared '_assets' folder to avoid
 	// path duplication and Windows MAX_PATH issues.
 	assetsBaseDir := filepath.Join(optOutputDir, onionAddr, "saved_site", "_assets")
+	
+	// 1. Write non-video assets
 	for origURL, body := range data.siteResources {
+		if body == nil {
+			continue // Handle videos separately
+		}
 		localRelativePath, ok := data.siteFilenames[origURL]
 		if !ok || localRelativePath == "index.html" {
 			continue
@@ -934,28 +620,100 @@ func saveSiteComplete(onionAddr, fullURL string, data *ScrapedData) error {
 		}
 
 		// Save to the SHARED assets folder
-		assetPath := filepath.Join(assetsBaseDir, localRelativePath)
-		assetDir := filepath.Dir(assetPath)
-		os.MkdirAll(windowsFriendlyPath(assetDir), 0755)
+		fullPath := windowsFriendlyPath(filepath.Join(assetsBaseDir, localRelativePath))
+		assetDir := filepath.Join(assetsBaseDir, filepath.Dir(localRelativePath))
+		os.MkdirAll(assetDir, 0755)
 
-		if err := os.WriteFile(windowsFriendlyPath(assetPath), body, 0644); err != nil {
-			fmt.Printf("[WARN] Could not save asset %s: %v\n", localRelativePath, err)
+		if err := os.WriteFile(fullPath, body, 0644); err != nil {
+			fmt.Printf("[WARN] Failed to save asset %s: %v\n", localRelativePath, err)
 		}
 	}
 
-	fmt.Printf("[SITE] Professional mirror saved to %s (%d assets)\n", windowsFriendlyPath(siteDir), len(data.siteResources))
+	// 2. Stream video assets via Tor Proxy
+	proxyURL, _ := url.Parse(TorProxyServer)
+	dialer, _ := proxy.FromURL(proxyURL, proxy.Direct)
+	transport := &http.Transport{
+		Dial:                dialer.Dial,
+		IdleConnTimeout:     90 * time.Second,
+		DisableKeepAlives:   false,
+		MaxIdleConns:        10,
+		MaxIdleConnsPerHost: 5,
+	}
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   60 * time.Minute,
+	}
+
+	for origURL, body := range data.siteResources {
+		if body != nil {
+			continue
+		}
+		localRelativePath := data.siteFilenames[origURL]
+		fullPath := windowsFriendlyPath(filepath.Join(assetsBaseDir, localRelativePath))
+		assetDir := filepath.Join(assetsBaseDir, filepath.Dir(localRelativePath))
+		os.MkdirAll(assetDir, 0755)
+
+		req, _ := http.NewRequest("GET", origURL, nil)
+		req.Header.Set("User-Agent", TorUA)
+		resp, err := client.Do(req)
+		if err != nil {
+			fmt.Printf("[WARN] Failed to stream video %s: %v\n", origURL, err)
+			continue
+		}
+		
+		out, err := os.Create(fullPath)
+		if err == nil {
+			pw := &ProgressWriter{
+				Total:    resp.ContentLength,
+				Filename: filepath.Base(localRelativePath),
+				Label:    "ASSET-VIDEO",
+			}
+			io.Copy(out, io.TeeReader(resp.Body, pw))
+			out.Close()
+			fmt.Println()
+		}
+		resp.Body.Close()
+	}
+
 	return nil
+}
+
+type ProgressWriter struct {
+	Total      int64
+	Downloaded int64
+	Filename   string
+	Label      string
+}
+
+func (pw *ProgressWriter) Write(p []byte) (int, error) {
+	n := len(p)
+	pw.Downloaded += int64(n)
+	pw.printProgress()
+	return n, nil
+}
+
+func (pw *ProgressWriter) printProgress() {
+	if pw.Total <= 0 {
+		fmt.Printf("\r[%s] %s: %d KB downloaded...", pw.Label, pw.Filename, pw.Downloaded/1024)
+		return
+	}
+	percent := float64(pw.Downloaded) / float64(pw.Total) * 100
+	width := 25
+	filled := int(float64(width) * float64(pw.Downloaded) / float64(pw.Total))
+	if filled > width { filled = width }
+	bar := strings.Repeat("=", filled) + strings.Repeat(" ", width-filled)
+	fmt.Printf("\r[%s] %s: [%s] %.1f%% (%d/%d KB)", pw.Label, pw.Filename, bar, percent, pw.Downloaded/1024, pw.Total/1024)
 }
 
 func saveScreenshot(onionAddr, fullURL string, screenshot []byte) error {
 	imgDir := filepath.Join(optOutputDir, onionAddr, "images")
-	if err := os.MkdirAll(imgDir, 0755); err != nil {
+	if err := os.MkdirAll(windowsFriendlyPath(imgDir), 0755); err != nil {
 		return err
 	}
 
 	filename := generateFilenameForFile(fullURL)
 	imgPath := filepath.Join(imgDir, filename+".png")
-	return os.WriteFile(imgPath, screenshot, 0644)
+	return os.WriteFile(windowsFriendlyPath(imgPath), screenshot, 0644)
 }
 
 func saveLinks(onionAddr, fullURL string, links []string) error {
@@ -964,13 +722,13 @@ func saveLinks(onionAddr, fullURL string, links []string) error {
 	}
 
 	linkDir := filepath.Join(optOutputDir, onionAddr, "discovered_links")
-	if err := os.MkdirAll(linkDir, 0755); err != nil {
+	if err := os.MkdirAll(windowsFriendlyPath(linkDir), 0755); err != nil {
 		return err
 	}
 
 	filename := generateFilenameForFile(fullURL)
 	filePath := filepath.Join(linkDir, filename+"_links.txt")
-	return os.WriteFile(filePath, []byte(strings.Join(links, "\n")), 0644)
+	return os.WriteFile(windowsFriendlyPath(filePath), []byte(strings.Join(links, "\n")), 0644)
 }
 
 func saveTitles(onionAddr, fullURL string, titles map[string]string) error {
