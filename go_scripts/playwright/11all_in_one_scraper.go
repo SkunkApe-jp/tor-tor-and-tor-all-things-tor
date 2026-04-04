@@ -191,12 +191,9 @@ func workerAllInOne(id int, port string, targetChan <-chan string, processedCoun
 	proxyServer := fmt.Sprintf("socks5://127.0.0.1:%s", port)
 
 	for onionAddr := range targetChan {
-		currentProcessed := atomic.AddInt32(processedCount, 1)
-		currentFailed := atomic.LoadInt32(failedCount)
-		currentCompleted := atomic.LoadInt32(completedCount)
-		remaining := totalTargets - currentProcessed
+		atomic.AddInt32(processedCount, 1)
 
-		fmt.Printf("\n[THREAD %d] [rem: %d | ok: %d | fail: %d] ..... %s (via port %s)\n", id, remaining, currentCompleted, currentFailed, onionAddr, port)
+		fmt.Printf("\n[THREAD %d] ..... %s (via port %s)\n", id, onionAddr, port)
 
 		data, err := processAllTypes(onionAddr, proxyServer)
 		if err != nil {
