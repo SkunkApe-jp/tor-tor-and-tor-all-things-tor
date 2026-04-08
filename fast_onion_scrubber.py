@@ -25,7 +25,9 @@ try:
 except ImportError:
     mmh3 = None
 from urllib.parse import urlparse
-from datetime import datetime
+from datetime import datetime, timezone
+import sys
+import struct
 
 # Standard settings for Tor (SOCKS5 proxy via httpx)
 TOR_PROXY = "socks5://127.0.0.1:9050"
@@ -85,7 +87,8 @@ async def init_db(db_path):
                 last_cert_not_after TEXT,
                 last_is_captcha INTEGER,
                 last_favicon_hash TEXT,
-                last_cms_fingerprint TEXT
+                last_cms_fingerprint TEXT,
+                last_open_ports TEXT
             )
         """)
         await db.execute(
@@ -117,7 +120,8 @@ async def init_db(db_path):
                 cert_not_after TEXT,
                 is_captcha INTEGER,
                 favicon_hash TEXT,
-                cms_fingerprint TEXT
+                cms_fingerprint TEXT,
+                open_ports TEXT
             )
         """
         )
@@ -142,6 +146,11 @@ async def init_db(db_path):
             await db.execute("ALTER TABLE sites ADD COLUMN last_cms_fingerprint TEXT")
             await db.execute("ALTER TABLE site_checks ADD COLUMN favicon_hash TEXT")
             await db.execute("ALTER TABLE site_checks ADD COLUMN cms_fingerprint TEXT")
+        except:
+            pass
+        try:
+            await db.execute("ALTER TABLE sites ADD COLUMN last_open_ports TEXT")
+            await db.execute("ALTER TABLE site_checks ADD COLUMN open_ports TEXT")
         except:
             pass
             
@@ -347,6 +356,37 @@ def detect_captcha(html_content, title):
     return 0
 
 
+async def check_port_via_socks(onion_host, target_port, proxy_host="127.0.0.1", proxy_port=9050, timeout=5.0):
+    """OPSEC Port Scanner checking arbitrary TCP ports against the onion service via Tor SOCKS5."""
+    try:
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(proxy_host, proxy_port), timeout=timeout)
+        
+        # SOCKS5 greeting
+        writer.write(b'\x05\x01\x00')
+        await writer.drain()
+        greeting_resp = await asyncio.wait_for(reader.readexactly(2), timeout=timeout)
+        if greeting_resp[0] != 0x05:
+            writer.close()
+            return False
+            
+        # SOCKS5 CONNECT
+        addr = onion_host.encode('ascii')
+        req = b'\x05\x01\x00\x03' + bytes([len(addr)]) + addr + struct.pack('>H', int(target_port))
+        writer.write(req)
+        await writer.drain()
+        
+        reply = await asyncio.wait_for(reader.readexactly(4), timeout=timeout)
+        success = (reply[1] == 0x00)
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        return success
+    except Exception:
+        return False
+
+
 class RateLimiter:
     def __init__(self, rps):
         self._rps = float(rps) if rps else 0.0
@@ -429,8 +469,8 @@ async def _flush_db(db, items):
             run_id, url, checked_at, port, status, latency_s, title, error_type, error_message,
             final_url, redirect_chain_len, content_hash, server_header, powered_by, content_type,
             content_length, external_links, internal_links, meta_description, meta_keywords,
-            cert_subject, cert_issuer, cert_not_after, is_captcha, favicon_hash, cms_fingerprint
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            cert_subject, cert_issuer, cert_not_after, is_captcha, favicon_hash, cms_fingerprint, open_ports
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """,
         [
             (
@@ -460,6 +500,7 @@ async def _flush_db(db, items):
                 i.get("is_captcha", 0),
                 i.get("favicon_hash"),
                 i.get("cms_fingerprint"),
+                i.get("open_ports"),
             )
             for i in items
         ],
@@ -471,8 +512,8 @@ async def _flush_db(db, items):
             last_error_type, last_error_message, last_final_url, last_redirect_chain_len,
             last_content_hash, last_server_header, last_powered_by, last_content_type,
             last_content_length, last_external_links, last_internal_links,
-            last_meta_description, last_meta_keywords, last_cert_subject, last_cert_issuer, last_cert_not_after, last_is_captcha, last_favicon_hash, last_cms_fingerprint
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            last_meta_description, last_meta_keywords, last_cert_subject, last_cert_issuer, last_cert_not_after, last_is_captcha, last_favicon_hash, last_cms_fingerprint, last_open_ports
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(url) DO UPDATE SET
             last_run_id=excluded.last_run_id,
             last_checked_at=excluded.last_checked_at,
@@ -497,7 +538,8 @@ async def _flush_db(db, items):
             last_cert_not_after=excluded.last_cert_not_after,
             last_is_captcha=excluded.last_is_captcha,
             last_favicon_hash=excluded.last_favicon_hash,
-            last_cms_fingerprint=excluded.last_cms_fingerprint
+            last_cms_fingerprint=excluded.last_cms_fingerprint,
+            last_open_ports=excluded.last_open_ports
     """,
         [
             (
@@ -526,6 +568,7 @@ async def _flush_db(db, items):
                 i.get("is_captcha", 0),
                 i.get("favicon_hash"),
                 i.get("cms_fingerprint"),
+                i.get("open_ports"),
             )
             for i in items
         ],
@@ -533,7 +576,7 @@ async def _flush_db(db, items):
     await db.commit()
 
 
-async def check_site(url, clients, semaphore, counter, rate_limiter, db_queue, results_queue, run_id, stop_event, max_retries):
+async def check_site(url, clients, semaphore, counter, rate_limiter, db_queue, results_queue, run_id, stop_event, max_retries, extra_ports):
     """Worker task for a single onion URL with port rotation."""
     async with semaphore:
         # Avoid hammering Tor too hard at the exact same millisecond
@@ -560,87 +603,97 @@ async def check_site(url, clients, semaphore, counter, rate_limiter, db_queue, r
             "is_captcha": 0,
             "favicon_hash": None,
             "cms_fingerprint": None,
+            "open_ports": None,
             "error_type": None,
             "error_message": None,
             "final_url": None,
             "redirect_chain_len": 0,
-            "checked_at": datetime.utcnow().isoformat(),
+            "checked_at": datetime.now(timezone.utc).isoformat(),
             "run_id": run_id,
         }
 
-        attempt = 0
-        while True:
-            try:
-                await rate_limiter.acquire()
-                start_time = time.perf_counter()
-                response = await client.get(url)
-                end_time = time.perf_counter()
-                result["latency_s"] = round(end_time - start_time, 2)
-                result["status"] = response.status_code
-                result["final_url"] = str(response.url)
-                if getattr(response, "history", None) is not None:
-                    result["redirect_chain_len"] = len(response.history)
+        try:
+            while True:
+                try:
+                    await rate_limiter.acquire()
+                    start_time = time.perf_counter()
+                    response = await client.get(url)
+                    end_time = time.perf_counter()
+                    result["latency_s"] = round(end_time - start_time, 2)
+                    result["status"] = response.status_code
+                    result["final_url"] = str(response.url)
+                    if getattr(response, "history", None) is not None:
+                        result["redirect_chain_len"] = len(response.history)
 
-                html_content = response.text
-                result["title"] = extract_title(html_content)
-                result["is_captcha"] = detect_captcha(html_content, result["title"])
-                result["success"] = response.status_code == 200
-                result["cms_fingerprint"] = detect_cms(html_content, response.headers, result["title"])
+                    html_content = response.text
+                    result["title"] = extract_title(html_content)
+                    result["is_captcha"] = detect_captcha(html_content, result["title"])
+                    result["success"] = response.status_code == 200
+                    result["cms_fingerprint"] = detect_cms(html_content, response.headers, result["title"])
 
-                if result["success"]:
-                    try:
-                        parsed = urlparse(result["final_url"] or url)
-                        fav_url = f"{parsed.scheme}://{parsed.netloc}/favicon.ico"
-                        fav_resp = await client.get(fav_url, timeout=3.0)
-                        if fav_resp.status_code == 200 and fav_resp.content:
-                            result["favicon_hash"] = shodan_favicon_hash(fav_resp.content)
-                    except Exception:
-                        pass
+                    if result["success"]:
+                        try:
+                            parsed = urlparse(result["final_url"] or url)
+                            fav_url = f"{parsed.scheme}://{parsed.netloc}/favicon.ico"
+                            fav_resp = await client.get(fav_url, timeout=3.0)
+                            if fav_resp.status_code == 200 and fav_resp.content:
+                                result["favicon_hash"] = shodan_favicon_hash(fav_resp.content)
+                        except Exception:
+                            pass
 
-                result["server_header"] = response.headers.get("server")
-                result["powered_by"] = response.headers.get("x-powered-by")
-                ct = response.headers.get("content-type")
-                result["content_type"] = ct.split(";")[0] if ct else None
-                result["content_length"] = len(html_content) if html_content else 0
-                result["content_hash"] = compute_content_hash(html_content)
+                    result["server_header"] = response.headers.get("server")
+                    result["powered_by"] = response.headers.get("x-powered-by")
+                    ct = response.headers.get("content-type")
+                    result["content_type"] = ct.split(";")[0] if ct else None
+                    result["content_length"] = len(html_content) if html_content else 0
+                    result["content_hash"] = compute_content_hash(html_content)
 
-                result["meta_description"] = extract_meta_tag(html_content, "description") or extract_meta_tag(
-                    html_content, "og:description"
-                )
-                result["meta_keywords"] = extract_meta_tag(html_content, "keywords")
+                    result["meta_description"] = extract_meta_tag(html_content, "description") or extract_meta_tag(
+                        html_content, "og:description"
+                    )
+                    result["meta_keywords"] = extract_meta_tag(html_content, "keywords")
 
-                internal, external = extract_links(html_content, result["final_url"] or url)
-                result["internal_links"] = internal
-                result["external_links"] = external
+                    internal, external = extract_links(html_content, result["final_url"] or url)
+                    result["internal_links"] = internal
+                    result["external_links"] = external
 
-                cert_info = extract_cert_info(response)
-                result["cert_subject"] = cert_info["subject"]
-                result["cert_issuer"] = cert_info["issuer"]
-                result["cert_not_after"] = cert_info["not_after"]
+                    cert_info = extract_cert_info(response)
+                    result["cert_subject"] = cert_info["subject"]
+                    result["cert_issuer"] = cert_info["issuer"]
+                    result["cert_not_after"] = cert_info["not_after"]
 
-                if result["status"] and is_transient_status(result["status"]) and attempt < max_retries:
-                    backoff = (0.5 * (2 ** attempt)) + random.uniform(0, 0.25)
-                    attempt += 1
-                    await asyncio.sleep(min(backoff, 10.0))
-                    continue
+                    if result["status"] and is_transient_status(result["status"]) and attempt < max_retries:
+                        backoff = (0.5 * (2 ** attempt)) + random.uniform(0, 0.25)
+                        attempt += 1
+                        await asyncio.sleep(min(backoff, 10.0))
+                        continue
+                        
+                    # Target OPSEC Port scan
+                    if extra_ports:
+                        found_ports = []
+                        parsed_node = urlparse(result["final_url"] or url).netloc or url.replace('http://', '').replace('https://', '').split('/')[0]
+                        for ep in extra_ports:
+                            if await check_port_via_socks(parsed_node, ep, proxy_port=int(port), timeout=3.0):
+                                found_ports.append(str(ep))
+                        result["open_ports"] = ",".join(found_ports) if found_ports else None
 
-                break
-            except Exception as e:
-                et, em = classify_error(e)
-                result["error_type"] = et
-                result["error_message"] = em
-                result["title"] = em
-                if attempt >= max_retries:
                     break
-                if isinstance(e, (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.RemoteProtocolError, httpx.PoolTimeout, httpx.WriteTimeout)):
-                    backoff = (0.5 * (2 ** attempt)) + random.uniform(0, 0.25)
-                    attempt += 1
-                    await asyncio.sleep(min(backoff, 10.0))
-                    continue
-                break
-
-        await db_queue.put(result)
-        await results_queue.put(result)
+                except Exception as e:
+                    et, em = classify_error(e)
+                    result["error_type"] = et
+                    result["error_message"] = em
+                    result["title"] = em
+                    if attempt >= max_retries:
+                        break
+                    if isinstance(e, (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.RemoteProtocolError, httpx.PoolTimeout, httpx.WriteTimeout)):
+                        backoff = (0.5 * (2 ** attempt)) + random.uniform(0, 0.25)
+                        attempt += 1
+                        await asyncio.sleep(min(backoff, 10.0))
+                        continue
+                    break
+        finally:
+            await db_queue.put(result)
+            await results_queue.put(result)
         return
 
 
@@ -680,14 +733,21 @@ async def main_async():
     parser.add_argument("--write-timeout", type=float, default=30.0)
     parser.add_argument("--pool-timeout", type=float, default=30.0)
     parser.add_argument("--max-retries", type=int, default=2)
+    parser.add_argument("--extra-ports", default="22,21,3306,8080,3389", help="Comma-separated OPSEC ports to scan (default: 22,21,3306,8080,3389). Pass empty string to disable.")
 
     args = parser.parse_args()
 
     ports = [p.strip() for p in args.ports.split(",")]
+    extra_ports = [int(p.strip()) for p in args.extra_ports.split(",") if p.strip().isdigit()]
 
     if not os.path.exists(args.input):
         print(f"[!] Error: {args.input} not found.")
         return
+
+    # Ensure UTF-8 output for Windows terminals
+    if sys.platform == "win32":
+        import io
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace', line_buffering=True)
 
     # Load and sanitize URLs
     with open(args.input, "r", encoding="utf-8") as f:
@@ -697,16 +757,16 @@ async def main_async():
 
     onion_pattern = re.compile(r"([a-zA-Z0-9_-]+\.onion)", re.I)
     urls = []
+    seen = set()
     for line in raw_lines:
         line = line.strip()
-        if line.lower().startswith(("http://", "https://")):
-            parsed = urlparse(line)
-            if parsed.netloc and parsed.netloc.lower().endswith(".onion"):
-                urls.append(line)
-                continue
-        match = onion_pattern.search(line)
-        if match:
-            urls.append(match.group(1))
+        # Find all onion addresses in the line, not just the first search result
+        found_onions = onion_pattern.findall(line)
+        for onion in found_onions:
+            u = onion.lower()
+            if u not in seen:
+                urls.append(u)
+                seen.add(u)
 
     if not urls:
         print("[!] No onions found in input.")
@@ -738,7 +798,7 @@ async def main_async():
         await db.execute("PRAGMA temp_store=MEMORY")
         await db.execute("PRAGMA busy_timeout=5000")
 
-        run_started_at = datetime.utcnow().isoformat()
+        run_started_at = datetime.now(timezone.utc).isoformat()
         input_hash = compute_input_hash(args.input)
         await db.execute(
             """
@@ -804,8 +864,16 @@ async def main_async():
             lat_sum = 0.0
             lat_n = 0
             slowest = []
-            while completed < total:
-                res = await results_queue.get()
+            while True:
+                try:
+                    res = await asyncio.wait_for(results_queue.get(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    if stop_event.is_set() and results_queue.empty():
+                        break
+                    if completed >= total and total > 0:
+                        break
+                    continue
+
                 completed += 1
                 status = res.get("status") or 0
                 if res.get("error_type") in ("ConnectTimeout", "ReadTimeout", "PoolTimeout", "WriteTimeout"):
@@ -838,9 +906,20 @@ async def main_async():
                 cms = f"[{res['cms_fingerprint']}] " if res.get("cms_fingerprint") else ""
                 links = f"L:{res.get('internal_links', 0)}+{res.get('external_links', 0)}"
                 captcha_str = " [CAPTCHA]" if res.get("is_captcha") else ""
-                print(
-                    f" [{completed}/{total}] {status_icon} [{latency_str}] [Port {res.get('port')}] {res.get('url')}{captcha_str} {cms}- {str(res.get('title',''))[:35]} | {server[:15]} | {links} | {desc[:30]}..."
-                )
+                ports_str = f" [OPEN:{res.get('open_ports')}]" if res.get("open_ports") else ""
+                
+                try:
+                    print(
+                        f" [{completed}/{total}] {status_icon} [{latency_str}] [Port {res.get('port')}] {res.get('url')}{captcha_str}{ports_str} {cms}- {str(res.get('title',''))[:35]} | {server[:15]} | {links} | {desc[:30]}...",
+                        flush=True
+                    )
+                except UnicodeEncodeError:
+                    # Fallback for non-UTF8 terminals
+                    safe_icon = "C" if res.get("is_captcha") else ("OK" if res.get("success") else "ER")
+                    print(
+                        f" [{completed}/{total}] {safe_icon} [{latency_str}] [Port {res.get('port')}] {res.get('url')}{captcha_str}{ports_str} {cms}- {str(res.get('title','')).encode('ascii', 'ignore').decode()[:35]}...",
+                        flush=True
+                    )
 
             avg_lat = (lat_sum / lat_n) if lat_n else 0.0
             slowest_sorted = sorted(slowest, reverse=True)
@@ -876,12 +955,27 @@ async def main_async():
                             run_id,
                             stop_event,
                             args.max_retries,
+                            extra_ports,
                         )
                     )
 
             stop_event.set()
-            await progress_task
-            await writer_task
+
+            # Give the progress consumer up to 10s to finish draining
+            try:
+                await asyncio.wait_for(progress_task, timeout=10.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                progress_task.cancel()
+
+            # Give the db writer up to 5s to flush remaining writes, then kill it
+            try:
+                await asyncio.wait_for(writer_task, timeout=5.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                writer_task.cancel()
+                try:
+                    await writer_task
+                except asyncio.CancelledError:
+                    pass
 
             duration = time.time() - start_time
             processed = len(urls)
@@ -891,7 +985,10 @@ async def main_async():
             print(f"[✓] Data persisted to {args.db}")
         finally:
             for client, _ in clients:
-                await client.aclose()
+                try:
+                    await asyncio.wait_for(client.aclose(), timeout=2.0)
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":
