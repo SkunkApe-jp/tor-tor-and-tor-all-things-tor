@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"crypto/sha256"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -47,6 +48,8 @@ var (
 	optCrossOrigin    bool
 	optNoJS           bool // Disable JavaScript
 	optEnableJS       bool // Enable JavaScript (override)
+	optStayUnderPath  bool // Only crawl under starting path
+	optMaxPages       int  // Max pages per target
 )
 
 // File type categories with their extensions
@@ -111,6 +114,8 @@ func init() {
 	flag.BoolVar(&optNoJS, "no-js", true, "Disable JavaScript execution (default: true for safety/speed)")
 	flag.BoolVar(&optEnableJS, "js", false, "Enable JavaScript execution if needed for dynamic sites")
 	flag.BoolVar(&optCrossOrigin, "cross-origin", true, "Save cross-origin files")
+	flag.BoolVar(&optStayUnderPath, "stay-under-path", true, "Only crawl URLs under the starting path")
+	flag.IntVar(&optMaxPages, "max-pages", 200, "Maximum pages to crawl per target")
 }
 
 func main() {
@@ -126,13 +131,8 @@ func main() {
 		return
 	}
 
-	// Create category subdirectories
-	for category := range fileCategories {
-		if err := os.MkdirAll(filepath.Join(optOutputDir, category), 0755); err != nil {
-			fmt.Printf("[ERROR] Could not create %s directory: %v\n", category, err)
-			return
-		}
-	}
+	// Skip category subdirectory creation - files go directly under domain folders
+	// Subfolders are created per URL path as needed during download
 
 	rand.Seed(time.Now().UnixNano())
 
@@ -271,7 +271,6 @@ func processAllTypes(onionAddr string, proxyServer string) (*ScrapedData, error)
 		resURL := response.URL()
 		lowerURL := strings.ToLower(resURL)
 
-		// Skip already captured
 		resMu.Lock()
 		if capturedFiles[resURL] {
 			resMu.Unlock()
@@ -279,22 +278,19 @@ func processAllTypes(onionAddr string, proxyServer string) (*ScrapedData, error)
 		}
 		resMu.Unlock()
 
-		// Check cross-origin
 		if !optCrossOrigin && !strings.Contains(resURL, onionAddr) {
 			return
 		}
 
-		// Determine category
 		category := detectCategory(lowerURL)
 		if category == "" {
-			return // Not a file we want to download
+			return
 		}
 
 		resMu.Lock()
 		capturedFiles[resURL] = true
 		resMu.Unlock()
 
-		// Get filename
 		filename := generateFilename(resURL, category)
 
 		info := FileInfo{
@@ -320,35 +316,165 @@ func processAllTypes(onionAddr string, proxyServer string) (*ScrapedData, error)
 	if !strings.HasPrefix(targetURL, "http://") && !strings.HasPrefix(targetURL, "https://") {
 		targetURL = "http://" + targetURL
 	}
+
+	// Parse base domain and path for same-origin and path filtering
+	baseParsed, err := url.Parse(targetURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid target URL: %v", err)
+	}
+	baseHost := baseParsed.Host
+	basePath := baseParsed.Path
+	// Ensure basePath ends with / for proper prefix matching
+	if basePath != "" && !strings.HasSuffix(basePath, "/") {
+		basePath = basePath + "/"
+	}
+	
+	fmt.Printf("[DEBUG] Starting crawl with basePath=%s depth=%d max-pages=%d\n", basePath, optDepth, optMaxPages)
+	
+	pageCount := 0
+
 	fmt.Printf("[LOAD] %s\n", targetURL)
 
-	if _, err := page.Goto(targetURL, playwright.PageGotoOptions{
-		WaitUntil: playwright.WaitUntilStateNetworkidle,
-		Timeout:   playwright.Float(120000),
-	}); err != nil {
-		return nil, fmt.Errorf("page load failed: %v", err)
-	}
+	// Crawl subdirectories with BFS
+	visited := make(map[string]bool)
+	queue := []string{targetURL}
+	visited[targetURL] = true
 
-	title, _ := page.Title()
-	data.pageTitle = title
+	currentDepth := 0
+	for len(queue) > 0 && currentDepth < optDepth {
+		levelSize := len(queue)
+		
+		for i := 0; i < levelSize; i++ {
+			currentURL := queue[0]
+			queue = queue[1:]
 
-	time.Sleep(time.Duration(pageLoadWait) * time.Second)
+			fmt.Printf("[CRAWL] Depth %d: %s\n", currentDepth, currentURL)
 
-	// Extract file links from <a> tags
-	extractFileLinks(page, onionAddr, data, capturedFiles, &resMu)
+			if _, err := page.Goto(currentURL, playwright.PageGotoOptions{
+				WaitUntil: playwright.WaitUntilStateNetworkidle,
+				Timeout:   playwright.Float(120000),
+			}); err != nil {
+				fmt.Printf("[WARN] Failed to load %s: %v\n", currentURL, err)
+				continue
+			}
 
-	if optDepth > 1 {
-		links, _ := page.Locator("a").All()
-		for i, link := range links {
-			if i >= 20 {
+			title, _ := page.Title()
+			if currentDepth == 0 {
+				data.pageTitle = title
+			}
+
+			time.Sleep(time.Duration(pageLoadWait) * time.Second)
+
+			// Extract file links from current page
+			extractFileLinks(page, currentURL, data, capturedFiles, &resMu)
+
+			// Find subdirectory links for next depth level
+			if currentDepth < optDepth-1 {
+				links, _ := page.Locator("a").All()
+				for _, link := range links {
+					href, err := link.GetAttribute("href")
+					if err != nil || href == "" {
+						continue
+					}
+
+					// Skip javascript and anchors
+					if strings.HasPrefix(href, "javascript:") || strings.HasPrefix(href, "#") {
+						continue
+					}
+
+					// Resolve relative URLs
+					var fullURL string
+					if strings.HasPrefix(href, "http://") || strings.HasPrefix(href, "https://") {
+						fullURL = href
+					} else {
+						currentParsed, _ := url.Parse(currentURL)
+						if currentParsed != nil {
+							rel, err := url.Parse(href)
+							if err != nil {
+								continue
+							}
+							resolved := currentParsed.ResolveReference(rel)
+							fullURL = resolved.String()
+						} else {
+							fullURL = href
+						}
+					}
+
+					// Normalize URL: strip query params and fragment for duplicate checking
+					// but keep original for actual crawling
+					normalizedURL := fullURL
+					if idx := strings.Index(normalizedURL, "?"); idx != -1 {
+						normalizedURL = normalizedURL[:idx]
+					}
+					if idx := strings.Index(normalizedURL, "#"); idx != -1 {
+						normalizedURL = normalizedURL[:idx]
+					}
+					// Ensure trailing / for directory URLs
+					if strings.HasSuffix(fullURL, "/") && !strings.HasSuffix(normalizedURL, "/") {
+						normalizedURL = normalizedURL + "/"
+					}
+
+					// Check same origin using normalized URL
+					linkParsed, err := url.Parse(normalizedURL)
+					if err != nil || linkParsed.Host != baseHost {
+						fmt.Printf("[DEBUG] Rejected (wrong host): %s\n", normalizedURL)
+						continue
+					}
+
+					// Check path constraint if enabled
+					if optStayUnderPath {
+						linkPath := linkParsed.Path
+						// Normalize linkPath to end with / for prefix check
+						if !strings.HasSuffix(linkPath, "/") {
+							linkPath = linkPath + "/"
+						}
+						if !strings.HasPrefix(linkPath, basePath) {
+							fmt.Printf("[DEBUG] Rejected (outside path): linkPath=%s basePath=%s\n", linkPath, basePath)
+							continue
+						}
+					}
+
+					// Check max pages limit
+					if pageCount >= optMaxPages {
+						fmt.Printf("[LIMIT] Reached max-pages (%d), stopping crawl\n", optMaxPages)
+						break
+					}
+
+					// Skip if already visited or queued (using normalized URL)
+					if visited[normalizedURL] {
+						fmt.Printf("[DEBUG] Rejected (already visited): %s (from: %s)\n", normalizedURL, fullURL)
+						continue
+					}
+
+					// Only follow if it's a directory-like URL (ends with / or has path structure)
+					// or if it's not a file URL
+					lowerURL := strings.ToLower(normalizedURL)
+					if detectCategory(lowerURL) != "" {
+						// It's a file URL, don't crawl it as a page
+						fmt.Printf("[DEBUG] Rejected (is file): %s\n", normalizedURL)
+						continue
+					}
+
+					visited[normalizedURL] = true
+					// Use normalized URL for queue to avoid duplicates
+					queue = append(queue, normalizedURL)
+					fmt.Printf("[QUEUE] Found subdirectory: %s (from href: %s)\n", normalizedURL, href)
+				}
+			}
+
+			pageCount++
+			if pageCount >= optMaxPages {
+				fmt.Printf("[LIMIT] Reached max-pages (%d), stopping crawl\n", optMaxPages)
 				break
 			}
-			href, _ := link.GetAttribute("href")
-			if href != "" && !strings.HasPrefix(href, "javascript:") {
-				link.Click()
-				time.Sleep(3 * time.Second)
+
+			if !optFastMode && currentDepth < optDepth-1 {
+				time.Sleep(time.Duration(3+rand.Intn(5)) * time.Second)
 			}
 		}
+
+		currentDepth++
+		fmt.Printf("[DEPTH] Completed level %d, %d pages queued for next level\n", currentDepth-1, len(queue))
 	}
 
 	return data, nil
@@ -381,7 +507,10 @@ func generateFilename(resURL, category string) string {
 		return fmt.Sprintf("%s_%s_%x", category, "unknown", hash[:8])
 	}
 
+	// Get the directory path and filename
+	dir := filepath.Dir(u.Path)
 	base := filepath.Base(u.Path)
+	
 	if base == "" || base == "." || base == "/" {
 		hash := sha256.Sum256([]byte(resURL))
 		base = fmt.Sprintf("%x_file", hash[:8])
@@ -398,6 +527,33 @@ func generateFilename(resURL, category string) string {
 
 	if len(clean) > 200 {
 		clean = clean[:200]
+	}
+
+	// Clean the directory path components
+	if dir != "" && dir != "." && dir != "/" {
+		// Remove leading slash and clean each component
+		dir = strings.TrimPrefix(dir, "/")
+		components := strings.Split(dir, "/")
+		var cleanedComponents []string
+		for _, comp := range components {
+			if comp == "" || comp == "." {
+				continue
+			}
+			// Clean component of invalid characters
+			cleanComp := strings.Map(func(r rune) rune {
+				if r == '<' || r == '>' || r == ':' || r == '"' || r == '/' ||
+					r == '\\' || r == '|' || r == '?' || r == '*' || r == '%' {
+					return '_'
+				}
+				return r
+			}, comp)
+			if cleanComp != "" {
+				cleanedComponents = append(cleanedComponents, cleanComp)
+			}
+		}
+		if len(cleanedComponents) > 0 {
+			return filepath.Join(append(cleanedComponents, clean)...)
+		}
 	}
 
 	return clean
@@ -417,7 +573,8 @@ func downloadAllFiles(onionAddr string, data *ScrapedData, proxyServer string) e
 	
 	if optResumeFiles {
 		for _, file := range data.files {
-			baseDir := filepath.Join(optOutputDir, file.Category, domainFolder)
+			// New structure: optOutputDir/domainFolder/subpath/filename (no category folder)
+			baseDir := filepath.Join(optOutputDir, domainFolder)
 			fullPath := windowsFriendlyPath(filepath.Join(baseDir, file.Filename))
 			
 			// Check if file exists and is complete
@@ -469,15 +626,17 @@ func downloadAllFiles(onionAddr string, data *ScrapedData, proxyServer string) e
 
 	totalFilesToDownload := len(filesToDownload)
 	for i, file := range filesToDownload {
-		baseDir := filepath.Join(optOutputDir, file.Category, domainFolder)
+		// New structure: optOutputDir/domainFolder/subpath/filename (no category folder)
+		baseDir := filepath.Join(optOutputDir, domainFolder)
 		fullPath := windowsFriendlyPath(filepath.Join(baseDir, file.Filename))
 
-		if err := os.MkdirAll(baseDir, 0755); err != nil {
-			fmt.Printf("[WARN] Failed to create directory %s: %v\n", baseDir, err)
+		// Create all subdirectories including those from the filename path
+		dirPath := filepath.Dir(fullPath)
+		if err := os.MkdirAll(dirPath, 0755); err != nil {
+			fmt.Printf("[WARN] Failed to create directory %s: %v\n", dirPath, err)
 			continue
 		}
 
-		// Download with retries
 		err := downloadFileWithRetry(client, file, fullPath, 5000, i+1, totalFilesToDownload)
 		if err != nil {
 			fmt.Printf("[WARN] Failed to download %s after retries: %v\n", file.URL, err)
@@ -604,7 +763,56 @@ func getTorProfilePath() string {
 	return filepath.Join(tmpDir, "playwright_tor_profile")
 }
 
+func saveFileMetadata(onionAddr string, data *ScrapedData) error {
+	// Extract domain for folder structure
+	domainFolder := extractDomainForFolder(onionAddr)
+	
+	// Create metadata directory
+	metaDir := filepath.Join(optOutputDir, "metadata")
+	if err := os.MkdirAll(metaDir, 0755); err != nil {
+		return err
+	}
+	
+	// Clean domain name for filename
+	safeDomain := strings.ReplaceAll(domainFolder, ":", "_")
+	safeDomain = strings.ReplaceAll(safeDomain, "/", "_")
+	metaFile := filepath.Join(metaDir, safeDomain+"_files.json")
+	
+	// Build metadata structure
+	type FileMeta struct {
+		URL      string `json:"url"`
+		Category string `json:"category"`
+		Filename string `json:"filename"`
+		RelPath  string `json:"rel_path"`  // Category/Domain/Subpath/Filename
+	}
+	
+	var metadata []FileMeta
+	for _, file := range data.files {
+		// New structure: domainFolder/subpath/filename (no category folder)
+		relPath := filepath.Join(domainFolder, file.Filename)
+		metadata = append(metadata, FileMeta{
+			URL:      file.URL,
+			Category: file.Category,
+			Filename: file.Filename,
+			RelPath:  relPath,
+		})
+	}
+	
+	// Write JSON
+	jsonData, err := json.MarshalIndent(metadata, "", "  ")
+	if err != nil {
+		return err
+	}
+	
+	return os.WriteFile(metaFile, jsonData, 0644)
+}
+
 func logSuccess(onionAddr string, data *ScrapedData) {
+	// Also save detailed metadata for file organization
+	if err := saveFileMetadata(onionAddr, data); err != nil {
+		fmt.Printf("[WARN] Failed to save metadata for %s: %v\n", onionAddr, err)
+	}
+	
 	f, err := os.OpenFile(optLogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return
