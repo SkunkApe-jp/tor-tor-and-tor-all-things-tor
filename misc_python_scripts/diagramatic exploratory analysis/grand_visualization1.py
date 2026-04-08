@@ -87,73 +87,46 @@ def get_image_dimensions(image_path):
 
 def find_screenshot_path(full_url, scraped_data_dir):
     """Find the appropriate screenshot for a URL based on its path structure."""
-    # Extract onion address from URL
     import urllib.parse
     parsed = urllib.parse.urlparse(full_url)
-    onion_match = re.search(r'([a-z2-7]{54,})\.onion', full_url)
-
-    if not onion_match:
+    
+    # Extract onion address part
+    host = parsed.netloc
+    if not host:
+        # try to find onion in path
+        onion_match = re.search(r'([a-z0-9-]{50,})\.onion', full_url)
+        if onion_match:
+            host = onion_match.group(0)
+    
+    if not host or '.onion' not in host:
         return "", None
 
-    onion_address = onion_match.group(1)
+    onion_address = host.replace('.onion', '')
+    url_path = parsed.path
 
-    # Build the path based on URL structure
-    path_parts = [p for p in parsed.path.strip('/').split('/') if p]
-
-    # Start with the base image directory
+    # Base image directory
     image_dir = os.path.join(scraped_data_dir, onion_address, 'images')
+    if not os.path.exists(image_dir):
+        return "", None
 
-    # Build the subdirectory path based on URL path
-    for part in path_parts[:-1]:  # All parts except the last one form the directory structure
-        image_dir = os.path.join(image_dir, part)
+    viz_dir = scraped_data_dir
 
-    # Create the expected filename based on the URL
-    if path_parts:  # If there are path parts
-        last_part = path_parts[-1]  # The last part of the path
-        # Create filename similar to how the Go app generates it
-        if '.' in last_part:
-            # If it's a file with extension, replace dots with underscores
-            clean_last_part = last_part.replace('.', '_')
-            expected_filename = f"{clean_last_part}.png"
-        else:
-            # If it's a directory path
-            expected_filename = f"{last_part}.png"
+    # 1. Check for specific {url_path}.png (highest priority)
+    if url_path and url_path != "/":
+        clean_path = url_path.strip('/')
+        if clean_path:
+            safe_name = clean_path.replace('/', '_').replace('.', '_')
+            path_path = os.path.join(image_dir, f"{safe_name}.png")
+            if os.path.exists(path_path):
+                rel_path = os.path.relpath(path_path, viz_dir)
+                return rel_path.replace('\\', '/'), None
 
-        # Full path to the expected image
-        expected_path = os.path.join(image_dir, expected_filename)
-
-        # Check if the file exists
-        if os.path.exists(expected_path):
-            # Calculate relative path from visualization file to the image
-            # Visualization is in scraped_data root
-            viz_dir = scraped_data_dir
-
-            # Path from viz_dir to the image file
-            rel_path = os.path.relpath(expected_path, viz_dir)
-            full_path = os.path.join(scraped_data_dir, rel_path)
-            dimensions = get_image_dimensions(full_path)
-            return rel_path.replace('\\', '/'), dimensions  # Normalize path separators
-    else:
-        # Root page - check for both possible naming schemes
-        # First check for index.png
+    # 2. Check for index.png (root page screenshot) ONLY if looking at the root path
+    if url_path == "" or url_path == "/":
         index_path = os.path.join(image_dir, "index.png")
         if os.path.exists(index_path):
-            # Calculate relative path from visualization file to the image
-            viz_dir = scraped_data_dir
             rel_path = os.path.relpath(index_path, viz_dir)
-            full_path = os.path.join(scraped_data_dir, rel_path)
-            dimensions = get_image_dimensions(full_path)
-            return rel_path.replace('\\', '/'), dimensions  # Normalize path separators
-
-        # Then check for onion_address.png
-        onion_path = os.path.join(image_dir, f"{onion_address}.png")
-        if os.path.exists(onion_path):
-            # Calculate relative path from visualization file to the image
-            viz_dir = scraped_data_dir
-            rel_path = os.path.relpath(onion_path, viz_dir)
-            full_path = os.path.join(scraped_data_dir, rel_path)
-            dimensions = get_image_dimensions(full_path)
-            return rel_path.replace('\\', '/'), dimensions  # Normalize path separators
+            return rel_path.replace('\\', '/'), None
 
     return "", None
 
@@ -169,92 +142,95 @@ def generate_grand_visualization(scraped_data_dir):
     nodes = []
     links = []
 
+    # 1. Build a URL -> Title mapping from website_identity folder
+    url_to_title = {}
+    for onion_addr in onion_sites:
+        identity_dir = os.path.join(scraped_data_dir, onion_addr, 'website_identity')
+        if os.path.exists(identity_dir):
+            for title_file in os.listdir(identity_dir):
+                if title_file.endswith('_title.txt'):
+                    try:
+                        with open(os.path.join(identity_dir, title_file), 'r', encoding='utf-8') as f:
+                            content = f.read().strip()
+                            if '->' in content:
+                                t_part, u_part = content.split('->', 1)
+                                t_val = t_part.strip().strip('[]')
+                                u_val = u_part.strip().rstrip('/')
+                                url_to_title[u_val] = t_val
+                                url_to_title[u_val.replace('http://', '').replace('https://', '')] = t_val
+                    except: pass
+
+    # Create nodes and links for the visualization
+    nodes = []
+    links = []
+
     # Create a mapping from URL to node index
     url_to_idx = {}
 
     # Process each onion site
     for onion_addr in onion_sites:
         site_dir = os.path.join(scraped_data_dir, onion_addr)
-        urls_dir = os.path.join(site_dir, 'urls')
-        htmls_dir = os.path.join(site_dir, 'htmls')
-        images_dir = os.path.join(site_dir, 'images')
-
+        
         # Get title for the root node
         root_url = f"http://{onion_addr}.onion"
-        root_html_file = os.path.join(htmls_dir, f"{onion_addr}.html")
-        root_title = extract_title_from_html(root_html_file)
+        root_title = url_to_title.get(root_url.rstrip('/')) or url_to_title.get(onion_addr)
         if not root_title:
-            root_title = root_url  # fallback to URL if no title found
+            root_html_file = os.path.join(site_dir, 'htmls', f"{onion_addr}.html")
+            root_title = extract_title_from_html(root_html_file) or root_url
 
-        # Read links for this onion site from all available links files
+        # Read links
         outbound_links = []
+        for d in ['urls', 'discovered_links']:
+            path = os.path.join(site_dir, d)
+            if os.path.exists(path):
+                for f in os.listdir(path):
+                    if f.endswith('_links.txt'):
+                        outbound_links.extend(read_links_file(os.path.join(path, f)))
 
-        # Get all links files in the urls directory for this onion site
-        if os.path.exists(urls_dir):
-            for file_name in os.listdir(urls_dir):
-                if file_name.endswith('_links.txt'):
-                    links_file_path = os.path.join(urls_dir, file_name)
-                    file_links = read_links_file(links_file_path)
-                    outbound_links.extend(file_links)
-
-        # Also get all links files in the discovered_links directory for this onion site
-        discovered_links_dir = os.path.join(site_dir, 'discovered_links')
-        if os.path.exists(discovered_links_dir):
-            for file_name in os.listdir(discovered_links_dir):
-                if file_name.endswith('_links.txt'):
-                    links_file_path = os.path.join(discovered_links_dir, file_name)
-                    file_links = read_links_file(links_file_path)
-                    outbound_links.extend(file_links)
-
-        # Add root node for this onion site
-        root_image_path, root_image_dims = find_screenshot_path(root_url, scraped_data_dir)
-        root_node = {
-            'id': root_url,
-            'name': root_url,
-            'title': root_title,
-            'image': root_image_path,
-            'group': 1  # Root nodes have group 1
-        }
+        # Add root node
+        root_image_path, _ = find_screenshot_path(root_url, scraped_data_dir)
+        if root_url not in url_to_idx:
+            url_to_idx[root_url] = len(nodes)
+            nodes.append({
+                'id': root_url,
+                'name': root_url,
+                'title': root_title,
+                'image': root_image_path,
+                'group': 1
+            })
         
-        # Add root node to nodes list and map
-        url_to_idx[root_url] = len(nodes)
-        nodes.append(root_node)
+        root_idx = url_to_idx[root_url]
 
         # Add outbound links as child nodes
-        for link in outbound_links:
-            # Extract onion address from link
-            onion_match = re.search(r'([a-z2-7]{54,})\.onion', link)
-            if onion_match:
-                # Get title from the scraped HTML if it exists
-                linked_onion = onion_match.group(1)
-                link_html_file = os.path.join(scraped_data_dir, linked_onion, 'htmls', f"{linked_onion}.html")
-                link_title = extract_title_from_html(link_html_file)
-                if not link_title:
-                    link_title = link  # fallback to URL if no title found
+        for link in set(outbound_links):
+            link_title = url_to_title.get(link.rstrip('/'))
+            if not link_title:
+                # try to extract from HTML if it's another local onion
+                onion_match = re.search(r'([a-z2-7]{50,})\.onion', link)
+                if onion_match:
+                    lo = onion_match.group(1)
+                    html_f = os.path.join(scraped_data_dir, lo, 'htmls', f"{lo}.html")
+                    link_title = extract_title_from_html(html_f)
+            
+            if not link_title: link_title = link
 
-                # Find screenshot path using the new function that considers the full URL
-                image_path, image_dims = find_screenshot_path(link, scraped_data_dir)
+            image_path, _ = find_screenshot_path(link, scraped_data_dir)
 
-                # Create child node
-                child_node = {
+            if link not in url_to_idx:
+                url_to_idx[link] = len(nodes)
+                nodes.append({
                     'id': link,
                     'name': link,
                     'title': link_title,
                     'image': image_path,
-                    'group': 2  # Child nodes have group 2
-                }
-                
-                # Add child node to nodes list and map if not already present
-                if link not in url_to_idx:
-                    url_to_idx[link] = len(nodes)
-                    nodes.append(child_node)
-                
-                # Create link from root to child
-                links.append({
-                    'source': url_to_idx[root_url],
-                    'target': url_to_idx[link],
-                    'value': 1
+                    'group': 2
                 })
+            
+            links.append({
+                'source': root_idx,
+                'target': url_to_idx[link],
+                'value': 1
+            })
 
     # Generate HTML with embedded JavaScript for D3 visualization
     html_content = f"""<!DOCTYPE html>
@@ -378,6 +354,19 @@ def generate_grand_visualization(scraped_data_dir):
         // Create a group for zooming
         const g = svg.append("g");
 
+        // Define arrowhead marker
+        g.append("defs").append("marker")
+            .attr("id", "arrowhead")
+            .attr("viewBox", "0 -5 10 10")
+            .attr("refX", 10)
+            .attr("refY", 0)
+            .attr("orient", "auto")
+            .attr("markerWidth", 5)
+            .attr("markerHeight", 5)
+            .append("path")
+            .attr("d", "M0,-5 L10,0 L0,5")
+            .attr("fill", "#666");
+
         // Create force simulation
         const simulation = d3.forceSimulation(nodes)
             .force("link", d3.forceLink(links).id((d, i) => i).distance(120).strength(0.6))
@@ -387,11 +376,13 @@ def generate_grand_visualization(scraped_data_dir):
 
         // Append links
         const link = g.append("g")
-            .attr("stroke", "#666")  // Dark gray for B&W theme
+            .attr("stroke", "#666")
             .attr("stroke-opacity", 0.7)
             .selectAll("line")
             .data(links)
-            .join("line");
+            .join("line")
+            .attr("class", "link")
+            .attr("marker-end", "url(#arrowhead)");
 
         // Create tooltip
         const tooltip = d3.select("#tooltip");
@@ -441,18 +432,10 @@ def generate_grand_visualization(scraped_data_dir):
 
         // Add hover functionality
         node.on("mouseover", function(event, d) {{
-            tooltip.transition()
-                .duration(200)
-                .style("opacity", .95);
-            if (d.image && d.image !== "") {{
-                tooltip.html(`<div><strong style="word-break: break-all;">${{d.title}}</strong></div><div style="font-size: 12px; color: #666; margin: 5px 0; word-break: break-all;">${{d.name}}</div><img src="${{d.image}}" style="max-width: 200px; max-height: 150px; margin-top: 5px; border: 1px solid #ddd;" onerror="this.parentNode.innerHTML+='<div style=\\'color:red; font-size:12px; word-break: break-all;\\'>${{d.title}}<br/>${{d.name}}<br/>Image not available</div>';">`)
-                    .style("left", (event.pageX + 10) + "px")
-                    .style("top", (event.pageY - 28) + "px");
-            }} else {{
-                tooltip.html(`<div><strong style="word-break: break-all;">${{d.title}}</strong></div><div style="font-size: 12px; color: #666; margin: 5px 0; word-break: break-all;">${{d.name}}</div><div style='color:red; font-size:12px;'>Image not available</div>`)
-                    .style("left", (event.pageX + 10) + "px")
-                    .style("top", (event.pageY - 28) + "px");
-            }}
+            tooltip.transition().duration(200).style("opacity", .95);
+            tooltip.html(`<div><strong style="word-break:break-all;">${{d.title}}</strong></div><div style="font-size:11px;color:#666;word-break:break-all;">${{d.id}}</div>${{d.image ? `<img src="${{d.image}}" style="max-width:200px;max-height:150px;margin-top:5px;border:1px solid #ddd;">` : ""}}`)
+                .style("left", (event.pageX + 10) + "px")
+                .style("top", (event.pageY - 28) + "px");
         }})
         .on("mouseout", function(d) {{
             tooltip.transition()
@@ -463,17 +446,25 @@ def generate_grand_visualization(scraped_data_dir):
         // Update positions on each tick
         simulation.on("tick", function() {{
             link
-                .attr("x1", function(d) {{ return nodes[d.source.index].x; }})
-                .attr("y1", function(d) {{ return nodes[d.source.index].y; }})
-                .attr("x2", function(d) {{ return nodes[d.target.index].x; }})
-                .attr("y2", function(d) {{ return nodes[d.target.index].y; }});
+                .attr("x1", d => d.source.x)
+                .attr("y1", d => d.source.y)
+                .attr("x2", d => {{
+                    const radius = d.target.image ? 45 : 12;
+                    const dx = d.target.x - d.source.x;
+                    const dy = d.target.y - d.source.y;
+                    const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+                    return d.target.x - (dx * radius / dist);
+                }})
+                .attr("y2", d => {{
+                    const radius = d.target.image ? 45 : 12;
+                    const dx = d.target.x - d.source.x;
+                    const dy = d.target.y - d.source.y;
+                    const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+                    return d.target.y - (dy * radius / dist);
+                }});
 
-            node
-                .attr("transform", function(d) {{ return "translate(" + d.x + "," + d.y + ")"; }});
-
-            label
-                .attr("x", function(d) {{ return d.x; }})
-                .attr("y", function(d) {{ return d.y; }});
+            node.attr("transform", d => `translate(${{d.x}},${{d.y}})`);
+            label.attr("x", d => d.x).attr("y", d => d.y);
         }});
 
         // Drag functions

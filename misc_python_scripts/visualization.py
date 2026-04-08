@@ -11,23 +11,24 @@ import matplotlib.pyplot as plt
 import numpy as np
 from pathlib import Path
 
+
 class Visualization:
     """Network visualization and analysis class."""
-    
+
     def __init__(self, json_file, output_dir, logger=None):
         self.json_file = Path(json_file)
         self.output_dir = Path(output_dir)
         self.logger = logger
         self.G = self._load_graph()
-        
+
     def _load_graph(self):
         """Load graph from JSON adjacency list."""
         if self.logger:
             self.logger.info(f"Loading graph from {self.json_file}")
-            
-        with open(self.json_file, 'r', encoding='utf-8') as f:
+
+        with open(self.json_file, "r", encoding="utf-8") as f:
             data = json.load(f)
-            
+
         G = nx.DiGraph()
         for source, targets in data.items():
             G.add_node(source)
@@ -39,16 +40,16 @@ class Visualization:
         """Basic graph visualization."""
         plt.figure(figsize=(12, 12))
         pos = nx.spring_layout(self.G, k=0.15, iterations=20)
-        nx.draw_networkx_nodes(self.G, pos, node_size=50, node_color='blue', alpha=0.6)
+        nx.draw_networkx_nodes(self.G, pos, node_size=50, node_color="blue", alpha=0.6)
         nx.draw_networkx_edges(self.G, pos, width=0.5, alpha=0.3, arrows=True)
         plt.title(f"Network Visualization ({self.G.number_of_nodes()} nodes)")
-        plt.axis('off')
+        plt.axis("off")
 
     def indegree_plot(self):
         """Plot in-degree distribution."""
         indegrees = [d for n, d in self.G.in_degree()]
         plt.figure(figsize=(10, 6))
-        plt.hist(indegrees, bins=20, color='green', alpha=0.7)
+        plt.hist(indegrees, bins=20, color="green", alpha=0.7)
         plt.title("In-degree Distribution")
         plt.xlabel("In-degree")
         plt.ylabel("Frequency")
@@ -59,9 +60,9 @@ class Visualization:
         top_nodes = sorted(self.G.in_degree(), key=lambda x: x[1], reverse=True)[:15]
         nodes, degrees = zip(*top_nodes) if top_nodes else ([], [])
         plt.figure(figsize=(12, 6))
-        plt.bar([n[:16] for n in nodes], degrees, color='green', alpha=0.7)
+        plt.bar([n[:16] for n in nodes], degrees, color="green", alpha=0.7)
         plt.title("Top 15 Nodes by In-degree")
-        plt.xticks(rotation=45, ha='right')
+        plt.xticks(rotation=45, ha="right")
         plt.ylabel("In-degree")
         plt.tight_layout()
 
@@ -69,7 +70,7 @@ class Visualization:
         """Plot out-degree distribution."""
         outdegrees = [d for n, d in self.G.out_degree()]
         plt.figure(figsize=(10, 6))
-        plt.hist(outdegrees, bins=20, color='orange', alpha=0.7)
+        plt.hist(outdegrees, bins=20, color="orange", alpha=0.7)
         plt.title("Out-degree Distribution")
         plt.xlabel("Out-degree")
         plt.ylabel("Frequency")
@@ -80,27 +81,47 @@ class Visualization:
         top_nodes = sorted(self.G.out_degree(), key=lambda x: x[1], reverse=True)[:15]
         nodes, degrees = zip(*top_nodes) if top_nodes else ([], [])
         plt.figure(figsize=(12, 6))
-        plt.bar([n[:16] for n in nodes], degrees, color='orange', alpha=0.7)
+        plt.bar([n[:16] for n in nodes], degrees, color="orange", alpha=0.7)
         plt.title("Top 15 Nodes by Out-degree")
-        plt.xticks(rotation=45, ha='right')
+        plt.xticks(rotation=45, ha="right")
         plt.ylabel("Out-degree")
         plt.tight_layout()
 
     def eigenvector_centrality_bar(self):
         """Bar chart of top nodes by eigenvector centrality."""
         try:
-            centrality = nx.eigenvector_centrality_numpy(self.G)
-            top_nodes = sorted(centrality.items(), key=lambda x: x[1], reverse=True)[:15]
+            if self.G.number_of_edges() == 0:
+                raise ValueError("Graph has no edges")
+            undirected = self.G.to_undirected()
+            if not nx.is_connected(undirected):
+                largest_cc = max(nx.connected_components(undirected), key=len)
+                subgraph = undirected.subgraph(largest_cc).copy()
+                centrality = nx.eigenvector_centrality_numpy(subgraph)
+            else:
+                centrality = nx.eigenvector_centrality_numpy(self.G)
+            top_nodes = sorted(centrality.items(), key=lambda x: x[1], reverse=True)[
+                :15
+            ]
             nodes, values = zip(*top_nodes) if top_nodes else ([], [])
             plt.figure(figsize=(12, 6))
-            plt.bar([n[:16] for n in nodes], values, color='purple', alpha=0.7)
+            plt.bar([n[:16] for n in nodes], values, color="purple", alpha=0.7)
             plt.title("Top 15 Nodes by Eigenvector Centrality")
-            plt.xticks(rotation=45, ha='right')
+            plt.xticks(rotation=45, ha="right")
             plt.ylabel("Centrality")
             plt.tight_layout()
         except Exception as e:
             if self.logger:
                 self.logger.error(f"Eigenvector centrality failed: {e}")
+            plt.figure(figsize=(12, 6))
+            plt.text(
+                0.5,
+                0.5,
+                f"Eigenvector centrality unavailable:\n{e}",
+                ha="center",
+                va="center",
+                transform=plt.gca().transAxes,
+            )
+            plt.title("Top 15 Nodes by Eigenvector Centrality")
 
     def pagerank_bar(self):
         """Bar chart of top nodes by PageRank."""
@@ -109,11 +130,21 @@ class Visualization:
             top_nodes = sorted(pagerank.items(), key=lambda x: x[1], reverse=True)[:15]
             nodes, values = zip(*top_nodes) if top_nodes else ([], [])
             plt.figure(figsize=(12, 6))
-            plt.bar([n[:16] for n in nodes], values, color='red', alpha=0.7)
+            plt.bar([n[:16] for n in nodes], values, color="red", alpha=0.7)
             plt.title("Top 15 Nodes by PageRank")
-            plt.xticks(rotation=45, ha='right')
+            plt.xticks(rotation=45, ha="right")
             plt.ylabel("PageRank Value")
             plt.tight_layout()
         except Exception as e:
             if self.logger:
                 self.logger.error(f"PageRank failed: {e}")
+            plt.figure(figsize=(12, 6))
+            plt.text(
+                0.5,
+                0.5,
+                f"PageRank unavailable:\n{e}",
+                ha="center",
+                va="center",
+                transform=plt.gca().transAxes,
+            )
+            plt.title("Top 15 Nodes by PageRank")

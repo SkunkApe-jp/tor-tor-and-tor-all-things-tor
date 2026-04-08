@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Grand Visualization Generator - Static Image Version
+Grand Visualization Generator
 
-Creates a high-resolution static image showing relationships between different onion sites.
+Creates a comprehensive visualization showing relationships between different onion sites.
 This visualization connects sites that link to each other, showing the network structure
 across all scraped onion sites.
 """
@@ -12,8 +12,10 @@ import json
 import re
 import urllib.parse
 from pathlib import Path
-import matplotlib.pyplot as plt
-import networkx as nx
+
+# Pre-compiled regex for onion address validation (v2: 16 chars, v3: 56 chars, or vanity: <=56 chars)
+ONION_PATTERN = re.compile(r'[a-z2-7]{1,56}')
+ONION_DIR_PATTERN = re.compile(r'^[a-z2-7]{1,56}$')
 
 def read_links_file(links_file_path):
     """Read links from the scraped links file."""
@@ -40,9 +42,9 @@ def extract_onion_addresses_from_file(file_path):
                     parsed = urllib.parse.urlparse(match)
                     if parsed.scheme and parsed.netloc and '.onion' in parsed.netloc:
                         # Extract just the onion address part
-                        onion_match = re.search(r'([a-z2-7]{54,}\.onion)', match)
+                        onion_match = ONION_PATTERN.search(match)
                         if onion_match:
-                            onion_addresses.add(onion_match.group(1))  # Store just the onion address
+                            onion_addresses.add(onion_match.group(0) + '.onion')
                 except:
                     continue
     return list(onion_addresses)
@@ -52,10 +54,8 @@ def get_onion_sites(scraped_data_dir):
     onion_dirs = []
     for item in os.listdir(scraped_data_dir):
         item_path = os.path.join(scraped_data_dir, item)
-        if os.path.isdir(item_path) and len(item) >= 50:  # Minimum length for onion addresses
-            # Verify it looks like an onion address (Base32)
-            if re.match(r'^[a-z2-7]{50,}$', item):
-                onion_dirs.append(item)
+        if os.path.isdir(item_path) and ONION_DIR_PATTERN.match(item):
+            onion_dirs.append(item)
     return onion_dirs
 
 def extract_title_from_html(html_file_path):
@@ -92,12 +92,12 @@ def find_screenshot_path(full_url, scraped_data_dir):
     # Extract onion address from URL
     import urllib.parse
     parsed = urllib.parse.urlparse(full_url)
-    onion_match = re.search(r'([a-z2-7]{54,})\.onion', full_url)
+    onion_match = ONION_PATTERN.search(full_url)
 
     if not onion_match:
         return "", None
 
-    onion_address = onion_match.group(1)
+    onion_address = onion_match.group(0)
 
     # Build the path based on URL structure
     path_parts = [p for p in parsed.path.strip('/').split('/') if p]
@@ -167,8 +167,12 @@ def generate_grand_visualization(scraped_data_dir):
     onion_sites = get_onion_sites(scraped_data_dir)
     print(f"Found {len(onion_sites)} onion sites to visualize")
 
-    print(f"Building Graph...")
-    G = nx.Graph()
+    # Create nodes and links for the visualization
+    nodes = []
+    links = []
+
+    # Create a mapping from URL to node index
+    url_to_idx = {}
 
     # Process each onion site
     for onion_addr in onion_sites:
@@ -206,17 +210,25 @@ def generate_grand_visualization(scraped_data_dir):
 
         # Add root node for this onion site
         root_image_path, root_image_dims = find_screenshot_path(root_url, scraped_data_dir)
+        root_node = {
+            'id': root_url,
+            'name': root_url,
+            'title': root_title,
+            'image': root_image_path,
+            'group': 1  # Root nodes have group 1
+        }
         
-        # Add root node
-        G.add_node(root_url, title=root_title, image=root_image_path, group=1)
+        # Add root node to nodes list and map
+        url_to_idx[root_url] = len(nodes)
+        nodes.append(root_node)
 
         # Add outbound links as child nodes
         for link in outbound_links:
             # Extract onion address from link
-            onion_match = re.search(r'([a-z2-7]{54,})\.onion', link)
+            onion_match = ONION_PATTERN.search(link)
             if onion_match:
                 # Get title from the scraped HTML if it exists
-                linked_onion = onion_match.group(1)
+                linked_onion = onion_match.group(0)
                 link_html_file = os.path.join(scraped_data_dir, linked_onion, 'htmls', f"{linked_onion}.html")
                 link_title = extract_title_from_html(link_html_file)
                 if not link_title:
@@ -225,111 +237,291 @@ def generate_grand_visualization(scraped_data_dir):
                 # Find screenshot path using the new function that considers the full URL
                 image_path, image_dims = find_screenshot_path(link, scraped_data_dir)
 
-                # Add child node
-                G.add_node(link, title=link_title, image=image_path, group=2)
-                G.add_edge(root_url, link)
+                # Create child node
+                child_node = {
+                    'id': link,
+                    'name': link,
+                    'title': link_title,
+                    'image': image_path,
+                    'group': 2  # Child nodes have group 2
+                }
+                
+                # Add child node to nodes list and map if not already present
+                if link not in url_to_idx:
+                    url_to_idx[link] = len(nodes)
+                    nodes.append(child_node)
+                
+                # Create link from root to child
+                links.append({
+                    'source': url_to_idx[root_url],
+                    'target': url_to_idx[link],
+                    'value': 1
+                })
 
-    print("Detecting communities (clusters)...")
-    from networkx.algorithms import community
-    import time
-    import sys
-    
-    start_time = time.time()
-    
-    # Progress tracker for community detection
-    def track_community_progress():
-        """Track progress during community detection with periodic updates"""
-        nodes_processed = 0
-        total_nodes = G.number_of_nodes()
-        last_update = 0
-        
-        def progress_callback():
-            nonlocal nodes_processed, last_update
-            nodes_processed += 1
-            current_time = time.time()
-            
-            # Update progress every 2 seconds or every 10% of nodes
-            if current_time - last_update > 2 or (nodes_processed % max(1, total_nodes // 10) == 0):
-                progress = min(100, (nodes_processed / total_nodes) * 100)
-                elapsed = current_time - start_time
-                sys.stdout.write(f"\rProgress: {progress:.1f}% ({nodes_processed}/{total_nodes} nodes, {elapsed:.1f}s elapsed)")
-                sys.stdout.flush()
-                last_update = current_time
-        
-        return progress_callback
-    
-    # Create progress tracker
-    progress_tracker = track_community_progress()
-    
-    # Show initial status
-    print(f"Processing {G.number_of_nodes()} nodes and {G.number_of_edges()} edges...")
-    
-    # Use Louvain algorithm for large graphs (much faster but still good quality)
-    print("Large graph detected - using Louvain algorithm for faster processing...")
-    communities = list(community.louvain_communities(G, seed=42))
-    
-    # Final progress update
-    elapsed = time.time() - start_time
-    print(f"\nCommunity detection completed in {elapsed:.2f} seconds, found {len(communities)} communities")
-    
-    # Create a color map for communities
-    community_map = {}
-    for i, comm in enumerate(communities):
-        for node in comm:
-            community_map[node] = i
-    
-    # Assign community ID to nodes for GEXF export and coloring
-    for node in G.nodes():
-        G.nodes[node]['community'] = community_map.get(node, -1)
-    node_colors = [community_map.get(node, -1) for node in G.nodes()]
+    # Generate HTML with embedded JavaScript for D3 visualization
+    html_content = f"""<!DOCTYPE html>
+<html>
+<head>
+    <title>Grand Onion Network Visualization</title>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <style>
+        body {{
+            margin: 0;
+            overflow: hidden;
+            background-color: white;
+            font-family: Arial, sans-serif;
+        }}
+        #tooltip {{
+            position: absolute;
+            text-align: left;
+            padding: 10px;
+            font-size: 14px;
+            background: rgba(255, 255, 255, 0.95);
+            color: black;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            pointer-events: none;
+            opacity: 0;
+            transition: opacity 0.3s;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            max-width: 300px;
+            z-index: 100;
+        }}
+        .node {{
+            cursor: pointer;
+        }}
+        .link {{
+            stroke: #999;
+            stroke-opacity: 0.6;
+        }}
+        #title {{
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            color: black;
+            font-size: 16px;
+            z-index: 10;
+            background: rgba(255, 255, 255, 0.8);
+            padding: 5px 10px;
+            border-radius: 4px;
+            border: 1px solid #ddd;
+        }}
+        #controls {{
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            z-index: 10;
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+        }}
+        .control-btn {{
+            background: rgba(255, 255, 255, 0.8);
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            padding: 8px 12px;
+            cursor: pointer;
+            font-size: 14px;
+            color: black;
+            text-align: center;
+            min-width: 40px;
+            user-select: none;
+        }}
+        .control-btn:hover {{
+            background: rgba(240, 240, 240, 0.9);
+        }}
+    </style>
+</head>
+<body>
+    <div id="title">Grand Onion Network Visualization ({len(nodes)} nodes, {len(links)} connections)</div>
+    <div id="controls">
+        <button class="control-btn" onclick="zoomIn()">+</button>
+        <button class="control-btn" onclick="zoomOut()">-</button>
+        <button class="control-btn" onclick="resetView()">↺</button>
+    </div>
+    <div id="tooltip"></div>
+    <script>
+        // Hierarchical data structure
+        const nodes = {json.dumps(nodes)};
+        const links = {json.dumps(links)};
 
-    print("Calculating PageRank (Identifying key nodes)...")
-    try:
-        pagerank = nx.pagerank(G, alpha=0.85)
-        # Scale pagerank for visibility
-        node_sizes = [10 + (pagerank.get(n, 0) * 3000) for n in G.nodes()]
-    except Exception as e:
-        print(f"PageRank calculation failed: {e}. Defaulting to uniform size.")
-        node_sizes = 10
+        // Chart dimensions
+        const width = window.innerWidth;
+        const height = window.innerHeight;
 
-    print("Calculating layout (this may take time)...")
-    pos = nx.spring_layout(G, k=0.15, iterations=50, seed=42)
+        // Create the container SVG
+        const svg = d3.select("body")
+            .append("svg")
+            .attr("width", "100%")
+            .attr("height", "100%")
+            .attr("style", "max-width: 100%; height: 100vh;");
 
-    print("Drawing image...")
-    plt.figure(figsize=(40, 40), dpi=100)
-    plt.axis('off')
-    
-    # Draw edges
-    nx.draw_networkx_edges(G, pos, alpha=0.1, edge_color='#999999', width=0.5)
-    
-    # Draw nodes sized by importance and colored by community
-    nx.draw_networkx_nodes(G, pos, node_size=node_sizes, node_color=node_colors, cmap=plt.cm.jet, alpha=0.7)
-    
-    plt.title(f"Grand Onion Network ({G.number_of_nodes()} nodes)", fontsize=24)
+        // Add zoom functionality with panning
+        const zoom = d3.zoom()
+            .scaleExtent([0.1, 8])
+            .on("zoom", (event) => {{
+                g.attr("transform", event.transform);
+            }});
+        svg.call(zoom);
 
-    output_file = os.path.join(scraped_data_dir, "grand_network_map.png")
-    plt.savefig(output_file, bbox_inches='tight', pad_inches=0.5)
-    plt.close()
+        // Create zoom functions
+        function zoomIn() {{
+            svg.transition().duration(750).call(zoom.scaleBy, 1.5);
+        }}
+
+        function zoomOut() {{
+            svg.transition().duration(750).call(zoom.scaleBy, 0.5);
+        }}
+
+        function resetView() {{
+            svg.transition().duration(750).call(zoom.scaleTo, 1);
+        }}
+
+        // Create a group for zooming
+        const g = svg.append("g");
+
+        // Create force simulation
+        const simulation = d3.forceSimulation(nodes)
+            .force("link", d3.forceLink(links).id((d, i) => i).distance(120).strength(0.6))
+            .force("charge", d3.forceManyBody().strength(-250))
+            .force("center", d3.forceCenter(width / 2, height / 2))
+            .force("collision", d3.forceCollide().radius(function(d) {{ return d.image && d.image !== "" ? 50 : 12; }}));
+
+        // Append links
+        const link = g.append("g")
+            .attr("stroke", "#666")  // Dark gray for B&W theme
+            .attr("stroke-opacity", 0.7)
+            .selectAll("line")
+            .data(links)
+            .join("line");
+
+        // Create tooltip
+        const tooltip = d3.select("#tooltip");
+
+        // Create groups for nodes
+        const node = g.append("g")
+            .selectAll("g")
+            .data(nodes)
+            .join("g")
+            .attr("cursor", "pointer")  // Indicate clickable
+            .on("click", function(event, d) {{
+                // Open the screenshot in a new tab when clicked (if available)
+                if (d.image && d.image !== "") {{
+                    window.open(d.image, '_blank');
+                }}
+            }})
+            .call(drag(simulation));
+
+        // Add images for nodes that have screenshots
+        node.filter(function(d) {{ return d.image && d.image !== ""; }})
+            .append("image")
+            .attr("xlink:href", function(d) {{ return d.image; }})
+            .attr("x", -40)  // 10x larger when image is present
+            .attr("y", -40)  // 10x larger when image is present
+            .attr("width", 80)  // 10x larger when image is present
+            .attr("height", 80)  // 10x larger when image is present
+            .attr("clip-path", "circle()");
+
+        // Add circles for nodes that don't have screenshots
+        node.filter(function(d) {{ return !(d.image && d.image !== ""); }})
+            .append("circle")
+            .attr("r", function(d) {{ return d.group === 1 ? 8 : 4; }})  // Larger for root nodes
+            .attr("fill", function(d) {{ return d.group === 1 ? "#000" : "#666"; }})  // Different colors for root vs child
+            .attr("stroke", function(d) {{ return d.group === 1 ? "#000" : "#666"; }})
+            .attr("stroke-width", 1.5);
+
+        // Add labels to nodes
+        const label = g.append("g")
+            .selectAll("text")
+            .data(nodes)
+            .join("text")
+            .text(function(d) {{ return d.group === 1 ? d.title.substring(0, 15) + (d.title.length > 15 ? "..." : "") : ""; }})
+            .attr("font-size", "10px")
+            .attr("dx", 10)
+            .attr("dy", 4)
+            .attr("fill", "#000");  // Black text for B&W theme
+
+        // Add hover functionality
+        node.on("mouseover", function(event, d) {{
+            tooltip.transition()
+                .duration(200)
+                .style("opacity", .95);
+            if (d.image && d.image !== "") {{
+                tooltip.html(`<div><strong style="word-break: break-all;">${{d.title}}</strong></div><div style="font-size: 12px; color: #666; margin: 5px 0; word-break: break-all;">${{d.name}}</div><img src="${{d.image}}" style="max-width: 200px; max-height: 150px; margin-top: 5px; border: 1px solid #ddd;" onerror="this.parentNode.innerHTML+='<div style=\\'color:red; font-size:12px; word-break: break-all;\\'>${{d.title}}<br/>${{d.name}}<br/>Image not available</div>';">`)
+                    .style("left", (event.pageX + 10) + "px")
+                    .style("top", (event.pageY - 28) + "px");
+            }} else {{
+                tooltip.html(`<div><strong style="word-break: break-all;">${{d.title}}</strong></div><div style="font-size: 12px; color: #666; margin: 5px 0; word-break: break-all;">${{d.name}}</div><div style='color:red; font-size:12px;'>Image not available</div>`)
+                    .style("left", (event.pageX + 10) + "px")
+                    .style("top", (event.pageY - 28) + "px");
+            }}
+        }})
+        .on("mouseout", function(d) {{
+            tooltip.transition()
+                .duration(500)
+                .style("opacity", 0);
+        }});
+
+        // Update positions on each tick
+        simulation.on("tick", function() {{
+            link
+                .attr("x1", function(d) {{ return nodes[d.source.index].x; }})
+                .attr("y1", function(d) {{ return nodes[d.source.index].y; }})
+                .attr("x2", function(d) {{ return nodes[d.target.index].x; }})
+                .attr("y2", function(d) {{ return nodes[d.target.index].y; }});
+
+            node
+                .attr("transform", function(d) {{ return "translate(" + d.x + "," + d.y + ")"; }});
+
+            label
+                .attr("x", function(d) {{ return d.x; }})
+                .attr("y", function(d) {{ return d.y; }});
+        }});
+
+        // Drag functions
+        function drag(simulation) {{
+            function dragstarted(event, d) {{
+                if (!event.active) simulation.alphaTarget(0.3).restart();
+                d.fx = d.x;
+                d.fy = d.y;
+            }}
+
+            function dragged(event, d) {{
+                d.fx = event.x;
+                d.fy = event.y;
+            }}
+
+            function dragended(event, d) {{
+                if (!event.active) simulation.alphaTarget(0);
+                d.fx = d.x;
+                d.fy = d.y;
+            }}
+
+            return d3.drag()
+                .on("start", dragstarted)
+                .on("drag", dragged)
+                .on("end", dragended);
+        }}
+
+        // Handle window resize
+        window.addEventListener("resize", () => {{
+            const newWidth = window.innerWidth;
+            const newHeight = window.innerHeight;
+
+            svg.attr("width", newWidth)
+               .attr("height", newHeight);
+        }});
+    </script>
+</body>
+</html>"""
+
+    # Write the HTML file
+    output_file = os.path.join(scraped_data_dir, "grand_network_visualization1.html")
+    with open(output_file, 'w', encoding='utf-8') as f:
+        f.write(html_content)
 
     print(f"Grand visualization created at {output_file}")
-    
-    # Export GEXF for Gephi
-    gexf_file = os.path.join(scraped_data_dir, "grand_network.gexf")
-    print(f"Exporting Gephi file to {gexf_file}...")
-    try:
-        nx.write_gexf(G, gexf_file)
-        print("Export successful!")
-    except Exception as e:
-        print(f"GEXF export failed: {e}")
-
-    # Generate community heatmap using separate module
-    from community_heatmap import generate_community_heatmap
-    generate_community_heatmap(G, communities, scraped_data_dir)
-    
-    # Generate anomaly detection
-    from anomaly_detection import detect_anomalies
-    detect_anomalies(G, communities, scraped_data_dir)
-
+    print(f"Network includes {len(nodes)} nodes and {len(links)} connections")
     return output_file
 
 def main():

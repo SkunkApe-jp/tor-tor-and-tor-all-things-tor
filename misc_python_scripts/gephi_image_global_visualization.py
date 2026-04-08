@@ -61,8 +61,20 @@ def extract_title_from_html(html_file_path):
             print(f"Error reading {html_file_path}: {str(e)}")
     return None
 
+def find_screenshot_path(onion_address, scraped_data_dir):
+    """Strict-path screenshot lookup."""
+    clean_addr = onion_address.replace('.onion', '')
+    image_dir = os.path.join(scraped_data_dir, clean_addr, 'images')
+    if not os.path.exists(image_dir): return ""
+    
+    # Global map usually just shows root images
+    index_path = os.path.join(image_dir, "index.png")
+    if os.path.exists(index_path):
+        return f"{clean_addr}/images/index.png"
+    return ""
+
 def generate_global_visualization(scraped_data_dir, export_gexf=True):
-    """Generate a global visualization with improved physics and stability."""
+    """Generate a global visualization with full interactivity."""
     onion_sites = get_onion_sites(scraped_data_dir)
     print(f"Found {len(onion_sites)} onion sites to visualize")
 
@@ -70,120 +82,138 @@ def generate_global_visualization(scraped_data_dir, export_gexf=True):
     for onion_addr in onion_sites:
         site_dir = os.path.join(scraped_data_dir, onion_addr)
         urls_dir = os.path.join(site_dir, 'urls')
-        htmls_dir = os.path.join(site_dir, 'htmls')
-        images_dir = os.path.join(site_dir, 'images')
-
-        all_onion_addresses = set()
-        # Check standard urls folder
-        if os.path.exists(urls_dir):
-            for file_name in os.listdir(urls_dir):
-                if file_name.endswith('_links.txt'):
-                    links_file_path = os.path.join(urls_dir, file_name)
-                    all_onion_addresses.update(extract_onion_addresses_from_file(links_file_path))
-
-        # Also check discovered_links folder
-        discovered_links_dir = os.path.join(site_dir, 'discovered_links')
-        if os.path.exists(discovered_links_dir):
-            for file_name in os.listdir(discovered_links_dir):
-                if file_name.endswith('_links.txt'):
-                    links_file_path = os.path.join(discovered_links_dir, file_name)
-                    all_onion_addresses.update(extract_onion_addresses_from_file(links_file_path))
-
-        main_html_file = os.path.join(htmls_dir, f"{onion_addr}.html")
-        title = extract_title_from_html(main_html_file)
-        if not title:
-            title = f"{onion_addr}.onion"
-
-        index_image_path = os.path.join(images_dir, "index.png")
-        onion_image_path = os.path.join(images_dir, f"{onion_addr}.png")
         
-        if os.path.exists(index_image_path):
-            image_path = f"{onion_addr}/images/index.png"
-        elif os.path.exists(onion_image_path):
-            image_path = f"{onion_addr}/images/{onion_addr}.png"
-        else:
-            image_path = ""
+        # 1. Title Discovery
+        title = None
+        identity_dir = os.path.join(site_dir, 'website_identity')
+        if os.path.exists(identity_dir):
+            for f in os.listdir(identity_dir):
+                if f.endswith('_title.txt'):
+                    try:
+                        with open(os.path.join(identity_dir, f), 'r', encoding='utf-8') as tf:
+                            line = tf.readline()
+                            if '->' in line: title = line.split('->', 1)[0].strip().strip('[]')
+                    except: pass
+        if not title:
+            title = extract_title_from_html(os.path.join(site_dir, 'htmls', f"{onion_addr}.html")) or f"{onion_addr}.onion"
+
+        # 2. Link Discovery
+        all_links = set()
+        for d in ['urls', 'discovered_links']:
+            p = os.path.join(site_dir, d)
+            if os.path.exists(p):
+                for f in os.listdir(p):
+                    if f.endswith('_links.txt'):
+                        all_links.update(extract_onion_addresses_from_file(os.path.join(p, f)))
 
         site_data[onion_addr] = {
             'title': title,
-            'connected_onions': list(all_onion_addresses),
-            'image_path': image_path
+            'connected_onions': list(all_links),
+            'image_path': find_screenshot_path(onion_addr, scraped_data_dir)
         }
 
+    # Prepare JSON for HTML Visualization
+    nodes = []
+    links = []
+    addr_to_idx = {}
+    for idx, (addr, data) in enumerate(site_data.items()):
+        addr_to_idx[addr] = idx
+        nodes.append({
+            'id': addr,
+            'title': data['title'],
+            'image': data['image_path'],
+            'group': 1
+        })
+    for source_addr, data in site_data.items():
+        for conn in data['connected_onions']:
+            pure = conn.replace('.onion', '')
+            if pure in addr_to_idx and source_addr != pure:
+                links.append({'source': addr_to_idx[source_addr], 'target': addr_to_idx[pure]})
+
+    # --- HTML BLOCK ---
+    html_content = f"""<!DOCTYPE html>
+<html>
+<head>
+    <title>Interconnected Gephi Network</title>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <style>
+        body {{ margin: 0; background: #050505; color: #fff; font-family: 'Segoe UI', sans-serif; overflow: hidden; }}
+        #tooltip {{
+            position: absolute; padding: 15px; background: rgba(0,0,0,0.85);
+            backdrop-filter: blur(8px); border: 1px solid #333; border-radius: 8px;
+            pointer-events: none; opacity: 0; transition: opacity 0.2s; z-index: 100;
+        }}
+        #tooltip img {{ max-width: 250px; border-radius: 4px; margin-top: 10px; border: 1px solid #444; }}
+        .link {{ stroke: #444; stroke-opacity: 0.4; }}
+        #overlay {{ position: absolute; top: 20px; left: 20px; z-index: 10; }}
+        h1 {{ margin: 0; font-size: 20px; color: #00DAFF; }}
+    </style>
+</head>
+<body>
+    <div id="overlay"><h1>Interconnected Gephi Network</h1></div>
+    <div id="tooltip"></div>
+    <script>
+        const nodes = {json.dumps(nodes)};
+        const links = {json.dumps(links)};
+        const width = window.innerWidth, height = window.innerHeight;
+
+        const svg = d3.select("body").append("svg").attr("width", "100%").attr("height", "100vh");
+        const g = svg.append("g");
+        svg.call(d3.zoom().on("zoom", (e) => g.attr("transform", e.transform)));
+
+        const simulation = d3.forceSimulation(nodes)
+            .force("link", d3.forceLink(links).id((d, i) => i).distance(150))
+            .force("charge", d3.forceManyBody().strength(-400))
+            .force("center", d3.forceCenter(width/2, height/2));
+
+        const link = g.append("g").selectAll("line").data(links).join("line").attr("class", "link");
+
+        const node = g.append("g").selectAll("g").data(nodes).join("g")
+            .on("mouseover", (event, d) => {{
+                d3.select("#tooltip").style("opacity", 1)
+                  .html(`<b>${{d.title}}</b><br/><small>${{d.id}}.onion</small>${{d.image ? `<br/><img src="${{d.image}}">` : ''}}`)
+                  .style("left", (event.pageX + 15) + "px").style("top", (event.pageY + 15) + "px");
+            }})
+            .on("mouseout", () => d3.select("#tooltip").style("opacity", 0))
+            .call(d3.drag().on("start", (e, d) => {{ if (!e.active) simulation.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; }})
+                          .on("drag", (e, d) => {{ d.fx = e.x; d.fy = e.y; }})
+                          .on("end", (e, d) => {{ if (!e.active) simulation.alphaTarget(0); d.fx = null; d.fy = null; }}));
+
+        node.append("circle").attr("r", d => d.image ? 15 : 8).attr("fill", d => d.image ? "#00DAFF" : "#555");
+        node.append("text").text(d => d.title.substring(0, 15)).attr("dy", 25).attr("text-anchor", "middle").attr("fill", "#aaa").attr("font-size", "10px");
+
+        simulation.on("tick", () => {{
+            link.attr("x1", d => d.source.x).attr("y1", d => d.source.y).attr("x2", d => d.target.x).attr("y2", d => d.target.y);
+            node.attr("transform", d => `translate(${{d.x}},${{d.y}})`);
+        }});
+    </script>
+</body>
+</html>"""
+    
+    with open(os.path.join(scraped_data_dir, "gephi_interactive_viz.html"), 'w', encoding='utf-8') as f:
+        f.write(html_content)
+
+    # --- GEOT / GEXF BLOCK ---
     print(f"Building Graph for {len(site_data)} nodes...")
+    import networkx as nx
     G = nx.Graph()
-
-    # Add nodes first
     for addr, data in site_data.items():
-        # Add attributes so they show up in Gephi or analysis
-        G.add_node(addr, title=data['title'], image=data['image_path'])
-
-    # Add edges
+        # Important: For Gephi plugins, absolute paths are most reliable
+        abs_img = os.path.abspath(os.path.join(scraped_data_dir, data['image_path'])) if data['image_path'] else ""
+        G.add_node(addr, title=data['title'], image=abs_img)
+    
     for source_addr, data in site_data.items():
         for connected_addr in data['connected_onions']:
-            pure_connected_addr = connected_addr.replace('.onion', '')
-            if pure_connected_addr in site_data and source_addr != pure_connected_addr:
-                G.add_edge(source_addr, pure_connected_addr)
-
-    print("Detecting communities (clusters)...")
-    # This algorithm finds groups of nodes that are more connected to each other than to the rest of the network.
-    from networkx.algorithms import community
-    communities = list(community.greedy_modularity_communities(G))
-    
-    # Create a color map for communities
-    community_map = {}
-    for i, comm in enumerate(communities):
-        for node in comm:
-            community_map[node] = i
-    
-    # Assign community ID and color to each node. This data will also be in the GEXF file for Gephi.
-    for node in G.nodes():
-        G.nodes[node]['community'] = community_map.get(node, -1)
-    node_colors = [community_map.get(node, -1) for node in G.nodes()]
-
-    print("Calculating PageRank (Identifying key nodes)...")
-    # This ranks nodes by influence. Key for visualizing "important" sites.
-    try:
-        pagerank = nx.pagerank(G, alpha=0.85)
-        # Scale pagerank for visibility (min size 10, plus importance factor)
-        node_sizes = [10 + (pagerank.get(n, 0) * 5000) for n in G.nodes()]
-    except Exception as e:
-        print(f"PageRank calculation failed: {e}. Defaulting to uniform size.")
-        node_sizes = 15
-
-    print("Calculating layout (this may take time for 10k+ nodes)...")
-    # k value controls spacing (larger = more spread out). iterations affects quality vs speed.
-    pos = nx.spring_layout(G, k=0.15, iterations=50, seed=42)
-
-    print("Drawing image...")
-    plt.figure(figsize=(40, 40), dpi=100)  # High resolution canvas (4000x4000px)
-    plt.axis('off')
-    
-    # Draw nodes and edges
-    # Use lower alpha and size for large networks to reduce clutter
-    nx.draw_networkx_edges(G, pos, alpha=0.1, edge_color='#999999', width=0.5)
-    
-    # Draw nodes sized by importance and colored by community
-    nx.draw_networkx_nodes(G, pos, node_size=node_sizes, node_color=node_colors, cmap=plt.cm.jet, alpha=0.7)
-    
-    plt.title(f"Global Onion Network ({G.number_of_nodes()} sites)", fontsize=24)
-
-    output_file = os.path.join(scraped_data_dir, "global_network_map.png")
-    plt.savefig(output_file, bbox_inches='tight', pad_inches=0.5)
-    plt.close()
-
-    print(f"Visualization created at {output_file}")
+            pure = connected_addr.replace('.onion', '')
+            if pure in site_data and source_addr != pure:
+                G.add_edge(source_addr, pure)
 
     if export_gexf:
         gexf_file = os.path.join(scraped_data_dir, "global_network.gexf")
-        print(f"Exporting Gephi file to {gexf_file}...")
-        try:
-            nx.write_gexf(G, gexf_file)
-            print("Export successful! Open this .gexf file in Gephi for 3D/Interactive analysis.")
-        except Exception as e:
-            print(f"GEXF export failed: {e}")
+        nx.write_gexf(G, gexf_file)
+        print(f"Interactive HTML and GEXF exported to {scraped_data_dir}")
 
-    return output_file
+    return os.path.join(scraped_data_dir, "gephi_interactive_viz.html")
 
 def main():
     scraped_data_dir = "../scraped_data"
