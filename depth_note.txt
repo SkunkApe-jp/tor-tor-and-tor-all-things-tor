@@ -1,0 +1,26 @@
+
+
+The `--depth` flag controls how many levels deep the scraper crawls **within the same site**.
+
+**How it works:**
+
+- `--depth=1` (default): Only scrapes the starting URL
+- `--depth=2`: Starting URL + all internal links found on that page
+- `--depth=3`: Starting URL + internal links + links on those pages
+- And so on...
+
+**Important:** It only follows links on the **same hostname** (e.g., `xvideos.com/page1` → `xvideos.com/page2`). External links are never crawled, only saved to the links file.
+
+**Example:**
+```bash
+# Scrape just the model page
+go run unified_scraper.go --depth=1
+
+# Scrape model page + all video pages linked from it
+go run unified_scraper.go --depth=2
+
+# Scrape model page + videos + related models + their videos
+go run unified_scraper.go --depth=3
+```
+
+**Warning:** Higher depths exponentially increase requests and time. Depth 3+ can easily hit hundreds of pages per target.
