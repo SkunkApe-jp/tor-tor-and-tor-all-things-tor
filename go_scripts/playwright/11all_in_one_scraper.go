@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -13,8 +14,11 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -50,6 +54,24 @@ var (
 	optEnableJS       bool // Enable JavaScript (override)
 	optStayUnderPath  bool // Only crawl under starting path
 	optMaxPages       int  // Max pages per target
+	optMaxFiles       int  // Max files to capture per target
+	optMaxBytesTarget int64
+	optMaxBytesFile   int64
+	optDLRetries      int
+	optDLWorkers      int
+	optAllowPathRegex string
+	optDenyPathRegex  string
+	optDenyQueryKeys  string
+	optMaxRuntimeSecs int
+	optBlockResources bool
+	optDumpOnFail     bool
+	optDLPreflight    bool
+)
+
+var (
+	allowPathRe   *regexp.Regexp
+	denyPathRe    *regexp.Regexp
+	denyQueryKeys map[string]bool
 )
 
 // File type categories with their extensions
@@ -92,6 +114,13 @@ type FileInfo struct {
 	Filename string
 }
 
+type DownloadedMeta struct {
+	FinalURL    string
+	ContentType string
+	Size        int64
+	SHA256      string
+}
+
 type ScrapedData struct {
 	pageTitle string
 	files     []FileInfo
@@ -115,11 +144,40 @@ func init() {
 	flag.BoolVar(&optEnableJS, "js", false, "Enable JavaScript execution if needed for dynamic sites")
 	flag.BoolVar(&optCrossOrigin, "cross-origin", true, "Save cross-origin files")
 	flag.BoolVar(&optStayUnderPath, "stay-under-path", true, "Only crawl URLs under the starting path")
-	flag.IntVar(&optMaxPages, "max-pages", 200, "Maximum pages to crawl per target")
+	flag.IntVar(&optMaxPages, "max-pages", 2000, "Maximum pages to crawl per target")
+	flag.IntVar(&optMaxFiles, "max-files", 20000, "Maximum files to capture per target")
+	flag.Int64Var(&optMaxBytesTarget, "max-bytes-target", 0, "Maximum bytes to download per target (0 = unlimited)")
+	flag.Int64Var(&optMaxBytesFile, "max-bytes-file", 0, "Maximum bytes to download per file (0 = unlimited)")
+	flag.IntVar(&optDLRetries, "dl-retries", 12, "Download retries per file")
+	flag.IntVar(&optDLWorkers, "dl-workers", 1, "Parallel downloads per target")
+	flag.StringVar(&optAllowPathRegex, "allow-path-regex", "", "Only crawl URLs whose path matches this regex (empty = allow all)")
+	flag.StringVar(&optDenyPathRegex, "deny-path-regex", "", "Do not crawl URLs whose path matches this regex (empty = deny none)")
+	flag.StringVar(&optDenyQueryKeys, "deny-query-keys", "", "Comma-separated query keys to skip crawling when present")
+	flag.IntVar(&optMaxRuntimeSecs, "max-runtime-target", 0, "Max runtime per target in seconds (0 = unlimited)")
+	flag.BoolVar(&optBlockResources, "block-resources", true, "Block images/fonts/media to reduce Tor load")
+	flag.BoolVar(&optDumpOnFail, "dump-on-fail", true, "Save screenshot+HTML on navigation failures")
+	flag.BoolVar(&optDLPreflight, "dl-preflight", false, "Preflight downloads with HEAD/GET to validate content-length/type when possible")
 }
 
 func main() {
 	flag.Parse()
+
+	var err error
+	if optAllowPathRegex != "" {
+		allowPathRe, err = regexp.Compile(optAllowPathRegex)
+		if err != nil {
+			fmt.Printf("[ERROR] invalid --allow-path-regex: %v\n", err)
+			return
+		}
+	}
+	if optDenyPathRegex != "" {
+		denyPathRe, err = regexp.Compile(optDenyPathRegex)
+		if err != nil {
+			fmt.Printf("[ERROR] invalid --deny-path-regex: %v\n", err)
+			return
+		}
+	}
+	denyQueryKeys = parseCSVSet(optDenyQueryKeys)
 
 	ports := parsePorts(optPorts)
 	if len(ports) == 0 {
@@ -137,7 +195,7 @@ func main() {
 	rand.Seed(time.Now().UnixNano())
 
 	fmt.Println("[CHECK] Verifying Tor connection...")
-	if !checkTorConnection() {
+	if !checkTorConnection(ports) {
 		fmt.Println("NOT CONNECTED TO TOR! Aborting.")
 		return
 	}
@@ -145,6 +203,9 @@ func main() {
 	workers := optWorkerCount
 	if workers <= 0 {
 		workers = 3
+	}
+	if optDLWorkers <= 0 {
+		optDLWorkers = 1
 	}
 
 	fmt.Println("[CHECK] Starting All-in-One Scraper v1.0...")
@@ -190,12 +251,26 @@ func main() {
 func workerAllInOne(id int, port string, targetChan <-chan string, processedCount, failedCount, completedCount *int32, totalTargets int32) {
 	proxyServer := fmt.Sprintf("socks5://127.0.0.1:%s", port)
 
+	pw, context, err := setupWorkerBrowser(proxyServer, id)
+	if err != nil {
+		fmt.Printf("[ERROR] Worker %d failed to start browser: %v\n", id, err)
+		return
+	}
+	defer func() {
+		if context != nil {
+			_ = context.Close()
+		}
+		if pw != nil {
+			pw.Stop()
+		}
+	}()
+
 	for onionAddr := range targetChan {
 		atomic.AddInt32(processedCount, 1)
 
 		fmt.Printf("\n[THREAD %d] ..... %s (via port %s)\n", id, onionAddr, port)
 
-		data, err := processAllTypes(onionAddr, proxyServer)
+		data, err := processAllTypes(context, onionAddr, proxyServer)
 		if err != nil {
 			fmt.Printf("[ERROR] Failed to process %s: %v\n", onionAddr, err)
 			logFailure(onionAddr, err)
@@ -203,7 +278,8 @@ func workerAllInOne(id int, port string, targetChan <-chan string, processedCoun
 			continue
 		}
 
-		if err := downloadAllFiles(onionAddr, data, proxyServer); err != nil {
+		bytesDownloaded, dlMeta, err := downloadAllFiles(onionAddr, data, proxyServer)
+		if err != nil {
 			fmt.Printf("[ERROR] Failed to download files from %s: %v\n", onionAddr, err)
 			logFailure(onionAddr, err)
 			atomic.AddInt32(failedCount, 1)
@@ -211,7 +287,7 @@ func workerAllInOne(id int, port string, targetChan <-chan string, processedCoun
 		}
 
 		atomic.AddInt32(completedCount, 1)
-		logSuccess(onionAddr, data)
+		logSuccess(onionAddr, data, bytesDownloaded, dlMeta)
 		fmt.Printf("[OK] Downloaded %d files from %s\n", len(data.files), onionAddr)
 
 		if !optFastMode {
@@ -224,16 +300,11 @@ func workerAllInOne(id int, port string, targetChan <-chan string, processedCoun
 	}
 }
 
-func processAllTypes(onionAddr string, proxyServer string) (*ScrapedData, error) {
-	data := &ScrapedData{
-		files: []FileInfo{},
-	}
-
+func setupWorkerBrowser(proxyServer string, workerID int) (*playwright.Playwright, playwright.BrowserContext, error) {
 	pw, err := playwright.Run()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	defer pw.Stop()
 
 	launchOptions := playwright.BrowserTypeLaunchPersistentContextOptions{
 		Headless: playwright.Bool(true),
@@ -250,17 +321,38 @@ func processAllTypes(onionAddr string, proxyServer string) (*ScrapedData, error)
 	}
 
 	context, err := pw.Chromium.LaunchPersistentContext(
-		getTorProfilePath(),
+		getTorProfilePath(workerID),
 		launchOptions,
 	)
 	if err != nil {
-		return nil, err
+		pw.Stop()
+		return nil, nil, err
 	}
-	defer context.Close()
+
+	return pw, context, nil
+}
+
+func processAllTypes(context playwright.BrowserContext, onionAddr string, proxyServer string) (*ScrapedData, error) {
+	data := &ScrapedData{
+		files: []FileInfo{},
+	}
 
 	page, err := context.NewPage()
 	if err != nil {
 		return nil, err
+	}
+	defer page.Close()
+
+	if optBlockResources {
+		_ = page.Route("**/*", func(route playwright.Route) {
+			request := route.Request()
+			switch request.ResourceType() {
+			case "image", "media", "font":
+				_ = route.Abort()
+				return
+			}
+			_ = route.Continue()
+		})
 	}
 	page.SetDefaultTimeout(300000)
 
@@ -288,6 +380,10 @@ func processAllTypes(onionAddr string, proxyServer string) (*ScrapedData, error)
 		}
 
 		resMu.Lock()
+		if optMaxFiles > 0 && len(data.files) >= optMaxFiles {
+			resMu.Unlock()
+			return
+		}
 		capturedFiles[resURL] = true
 		resMu.Unlock()
 
@@ -299,7 +395,13 @@ func processAllTypes(onionAddr string, proxyServer string) (*ScrapedData, error)
 			Filename: filename,
 		}
 
+		resMu.Lock()
+		if optMaxFiles > 0 && len(data.files) >= optMaxFiles {
+			resMu.Unlock()
+			return
+		}
 		data.files = append(data.files, info)
+		resMu.Unlock()
 		fmt.Printf("[DETECTED] [%s] %s\n", category, filepath.Base(filename))
 	})
 
@@ -317,17 +419,16 @@ func processAllTypes(onionAddr string, proxyServer string) (*ScrapedData, error)
 		targetURL = "http://" + targetURL
 	}
 
+	startTime := time.Now()
+	maxRuntime := time.Duration(optMaxRuntimeSecs) * time.Second
+
 	// Parse base domain and path for same-origin and path filtering
 	baseParsed, err := url.Parse(targetURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid target URL: %v", err)
 	}
-	baseHost := baseParsed.Host
+	baseHost := canonicalHost(baseParsed)
 	basePath := baseParsed.Path
-	// Ensure basePath ends with / for proper prefix matching
-	if basePath != "" && !strings.HasSuffix(basePath, "/") {
-		basePath = basePath + "/"
-	}
 	
 	fmt.Printf("[DEBUG] Starting crawl with basePath=%s depth=%d max-pages=%d\n", basePath, optDepth, optMaxPages)
 	
@@ -335,146 +436,151 @@ func processAllTypes(onionAddr string, proxyServer string) (*ScrapedData, error)
 
 	fmt.Printf("[LOAD] %s\n", targetURL)
 
-	// Crawl subdirectories with BFS
+	type crawlItem struct {
+		URL   string
+		Depth int
+	}
+
+	// Crawl subdirectories with BFS (depth per URL item)
 	visited := make(map[string]bool)
-	queue := []string{targetURL}
-	visited[targetURL] = true
+	startCanon, err := canonicalizeForVisit(targetURL, denyQueryKeys)
+	if err != nil {
+		return nil, err
+	}
+	queue := []crawlItem{{URL: startCanon, Depth: 0}}
+	visited[startCanon] = true
 
-	currentDepth := 0
-	for len(queue) > 0 && currentDepth < optDepth {
-		levelSize := len(queue)
-		
-		for i := 0; i < levelSize; i++ {
-			currentURL := queue[0]
-			queue = queue[1:]
+	for len(queue) > 0 {
+		if maxRuntime > 0 && time.Since(startTime) > maxRuntime {
+			fmt.Printf("[LIMIT] Reached max-runtime-target (%v), stopping crawl\n", maxRuntime)
+			break
+		}
 
-			fmt.Printf("[CRAWL] Depth %d: %s\n", currentDepth, currentURL)
+		item := queue[0]
+		queue = queue[1:]
+		if item.Depth >= optDepth {
+			continue
+		}
 
-			if _, err := page.Goto(currentURL, playwright.PageGotoOptions{
-				WaitUntil: playwright.WaitUntilStateNetworkidle,
-				Timeout:   playwright.Float(120000),
-			}); err != nil {
-				fmt.Printf("[WARN] Failed to load %s: %v\n", currentURL, err)
-				continue
+		if _, err := page.Goto(item.URL, playwright.PageGotoOptions{
+			WaitUntil: playwright.WaitUntilStateNetworkidle,
+			Timeout:   playwright.Float(120000),
+		}); err != nil {
+			fmt.Printf("[WARN] Failed to load %s: %v\n", item.URL, err)
+			if optDumpOnFail {
+				_ = dumpPageFailure(onionAddr, page, "goto")
 			}
+			continue
+		}
 
-			title, _ := page.Title()
-			if currentDepth == 0 {
-				data.pageTitle = title
-			}
+		title, _ := page.Title()
+		if item.Depth == 0 {
+			data.pageTitle = title
+		}
 
-			time.Sleep(time.Duration(pageLoadWait) * time.Second)
+		time.Sleep(time.Duration(pageLoadWait) * time.Second)
 
-			// Extract file links from current page
-			extractFileLinks(page, currentURL, data, capturedFiles, &resMu)
+		// Extract file links from current page
+		extractFileLinks(page, item.URL, data, capturedFiles, &resMu)
 
-			// Find subdirectory links for next depth level
-			if currentDepth < optDepth-1 {
-				links, _ := page.Locator("a").All()
-				for _, link := range links {
-					href, err := link.GetAttribute("href")
-					if err != nil || href == "" {
-						continue
-					}
+		// Find subdirectory links for next depth level
+		if item.Depth+1 < optDepth {
+			links, _ := page.Locator("a").All()
+			for _, link := range links {
+				href, err := link.GetAttribute("href")
+				if err != nil || href == "" {
+					continue
+				}
 
-					// Skip javascript and anchors
-					if strings.HasPrefix(href, "javascript:") || strings.HasPrefix(href, "#") {
-						continue
-					}
+				// Skip javascript and anchors
+				if strings.HasPrefix(href, "javascript:") || strings.HasPrefix(href, "#") {
+					continue
+				}
 
-					// Resolve relative URLs
-					var fullURL string
-					if strings.HasPrefix(href, "http://") || strings.HasPrefix(href, "https://") {
-						fullURL = href
-					} else {
-						currentParsed, _ := url.Parse(currentURL)
-						if currentParsed != nil {
-							rel, err := url.Parse(href)
-							if err != nil {
-								continue
-							}
-							resolved := currentParsed.ResolveReference(rel)
-							fullURL = resolved.String()
-						} else {
-							fullURL = href
-						}
-					}
-
-					// Normalize URL: strip query params and fragment for duplicate checking
-					// but keep original for actual crawling
-					normalizedURL := fullURL
-					if idx := strings.Index(normalizedURL, "?"); idx != -1 {
-						normalizedURL = normalizedURL[:idx]
-					}
-					if idx := strings.Index(normalizedURL, "#"); idx != -1 {
-						normalizedURL = normalizedURL[:idx]
-					}
-					// Ensure trailing / for directory URLs
-					if strings.HasSuffix(fullURL, "/") && !strings.HasSuffix(normalizedURL, "/") {
-						normalizedURL = normalizedURL + "/"
-					}
-
-					// Check same origin using normalized URL
-					linkParsed, err := url.Parse(normalizedURL)
-					if err != nil || linkParsed.Host != baseHost {
-						fmt.Printf("[DEBUG] Rejected (wrong host): %s\n", normalizedURL)
-						continue
-					}
-
-					// Check path constraint if enabled
-					if optStayUnderPath {
-						linkPath := linkParsed.Path
-						// Normalize linkPath to end with / for prefix check
-						if !strings.HasSuffix(linkPath, "/") {
-							linkPath = linkPath + "/"
-						}
-						if !strings.HasPrefix(linkPath, basePath) {
-							fmt.Printf("[DEBUG] Rejected (outside path): linkPath=%s basePath=%s\n", linkPath, basePath)
+				// Resolve relative URLs
+				var fullURL string
+				if strings.HasPrefix(href, "http://") || strings.HasPrefix(href, "https://") {
+					fullURL = href
+				} else {
+					currentParsed, _ := url.Parse(item.URL)
+					if currentParsed != nil {
+						rel, err := url.Parse(href)
+						if err != nil {
 							continue
 						}
+						resolved := currentParsed.ResolveReference(rel)
+						fullURL = resolved.String()
+					} else {
+						fullURL = href
 					}
-
-					// Check max pages limit
-					if pageCount >= optMaxPages {
-						fmt.Printf("[LIMIT] Reached max-pages (%d), stopping crawl\n", optMaxPages)
-						break
-					}
-
-					// Skip if already visited or queued (using normalized URL)
-					if visited[normalizedURL] {
-						fmt.Printf("[DEBUG] Rejected (already visited): %s (from: %s)\n", normalizedURL, fullURL)
-						continue
-					}
-
-					// Only follow if it's a directory-like URL (ends with / or has path structure)
-					// or if it's not a file URL
-					lowerURL := strings.ToLower(normalizedURL)
-					if detectCategory(lowerURL) != "" {
-						// It's a file URL, don't crawl it as a page
-						fmt.Printf("[DEBUG] Rejected (is file): %s\n", normalizedURL)
-						continue
-					}
-
-					visited[normalizedURL] = true
-					// Use normalized URL for queue to avoid duplicates
-					queue = append(queue, normalizedURL)
-					fmt.Printf("[QUEUE] Found subdirectory: %s (from href: %s)\n", normalizedURL, href)
 				}
-			}
 
-			pageCount++
-			if pageCount >= optMaxPages {
-				fmt.Printf("[LIMIT] Reached max-pages (%d), stopping crawl\n", optMaxPages)
-				break
-			}
+				canon, err := canonicalizeForVisit(fullURL, denyQueryKeys)
+				if err != nil {
+					continue
+				}
 
-			if !optFastMode && currentDepth < optDepth-1 {
-				time.Sleep(time.Duration(3+rand.Intn(5)) * time.Second)
+				linkParsed, err := url.Parse(canon)
+				if err != nil || canonicalHost(linkParsed) != baseHost {
+					fmt.Printf("[DEBUG] Rejected (wrong host): %s\n", canon)
+					continue
+				}
+
+				// Check path constraint if enabled
+				if optStayUnderPath {
+					linkPath := linkParsed.Path
+					if !strings.HasPrefix(linkPath, basePath) {
+						fmt.Printf("[DEBUG] Rejected (outside path): linkPath=%s basePath=%s\n", linkPath, basePath)
+						continue
+					}
+				}
+
+				if allowPathRe != nil && !allowPathRe.MatchString(linkParsed.Path) {
+					continue
+				}
+				if denyPathRe != nil && denyPathRe.MatchString(linkParsed.Path) {
+					continue
+				}
+				if hasAnyQueryKey(fullURL, denyQueryKeys) {
+					continue
+				}
+
+				// Check max pages limit
+				if pageCount >= optMaxPages {
+					fmt.Printf("[LIMIT] Reached max-pages (%d), stopping crawl\n", optMaxPages)
+					break
+				}
+
+				// Skip if already visited or queued
+				if visited[canon] {
+					fmt.Printf("[DEBUG] Rejected (already visited): %s (from: %s)\n", canon, fullURL)
+					continue
+				}
+
+				// Only follow if it's a directory-like URL (ends with / or has path structure)
+				// or if it's not a file URL
+				lowerURL := strings.ToLower(canon)
+				if detectCategory(lowerURL) != "" {
+					// It's a file URL, don't crawl it as a page, but do capture it for download.
+					captureFileURL(canon, data, capturedFiles, &resMu)
+					continue
+				}
+
+				visited[canon] = true
+				queue = append(queue, crawlItem{URL: canon, Depth: item.Depth + 1})
+				fmt.Printf("[QUEUE] Found subdirectory: %s (from href: %s)\n", canon, href)
 			}
 		}
 
-		currentDepth++
-		fmt.Printf("[DEPTH] Completed level %d, %d pages queued for next level\n", currentDepth-1, len(queue))
+		pageCount++
+		if pageCount >= optMaxPages {
+			fmt.Printf("[LIMIT] Reached max-pages (%d), stopping crawl\n", optMaxPages)
+			break
+		}
+
+		if !optFastMode && item.Depth+1 < optDepth {
+			time.Sleep(time.Duration(3+rand.Intn(5)) * time.Second)
+		}
 	}
 
 	return data, nil
@@ -559,9 +665,9 @@ func generateFilename(resURL, category string) string {
 	return clean
 }
 
-func downloadAllFiles(onionAddr string, data *ScrapedData, proxyServer string) error {
+func downloadAllFiles(onionAddr string, data *ScrapedData, proxyServer string) (int64, map[string]DownloadedMeta, error) {
 	if len(data.files) == 0 {
-		return nil
+		return 0, map[string]DownloadedMeta{}, nil
 	}
 
 	// Extract clean domain for folder structure
@@ -593,7 +699,7 @@ func downloadAllFiles(onionAddr string, data *ScrapedData, proxyServer string) e
 		
 		if len(filesToDownload) == 0 {
 			fmt.Println("[RESUME] All files already downloaded!")
-			return nil
+			return 0, map[string]DownloadedMeta{}, nil
 		}
 	} else {
 		filesToDownload = data.files
@@ -602,11 +708,11 @@ func downloadAllFiles(onionAddr string, data *ScrapedData, proxyServer string) e
 	// Setup Tor Proxy Client
 	proxyURL, err := url.Parse(proxyServer)
 	if err != nil {
-		return fmt.Errorf("invalid proxy URL: %v", err)
+		return 0, nil, fmt.Errorf("invalid proxy URL: %v", err)
 	}
 	dialer, err := proxy.FromURL(proxyURL, proxy.Direct)
 	if err != nil {
-		return fmt.Errorf("could not create proxy dialer: %v", err)
+		return 0, nil, fmt.Errorf("could not create proxy dialer: %v", err)
 	}
 
 	transport := &http.Transport{
@@ -621,44 +727,115 @@ func downloadAllFiles(onionAddr string, data *ScrapedData, proxyServer string) e
 		Timeout:   30 * time.Minute,
 	}
 
+	var bytesDownloaded int64
+	startTime := time.Now()
+	maxRuntime := time.Duration(optMaxRuntimeSecs) * time.Second
+	var fileCounter int32
+
 	// Group files by category for summary
+	var catMu sync.Mutex
 	categoryCounts := make(map[string]int)
+	metaMu := sync.Mutex{}
+	downloadMeta := make(map[string]DownloadedMeta)
 
 	totalFilesToDownload := len(filesToDownload)
-	for i, file := range filesToDownload {
-		// New structure: optOutputDir/domainFolder/subpath/filename (no category folder)
-		baseDir := filepath.Join(optOutputDir, domainFolder)
-		fullPath := windowsFriendlyPath(filepath.Join(baseDir, file.Filename))
+	jobs := make(chan FileInfo)
+	var wg sync.WaitGroup
 
-		// Create all subdirectories including those from the filename path
-		dirPath := filepath.Dir(fullPath)
-		if err := os.MkdirAll(dirPath, 0755); err != nil {
-			fmt.Printf("[WARN] Failed to create directory %s: %v\n", dirPath, err)
-			continue
-		}
-
-		err := downloadFileWithRetry(client, file, fullPath, 5000, i+1, totalFilesToDownload)
-		if err != nil {
-			fmt.Printf("[WARN] Failed to download %s after retries: %v\n", file.URL, err)
-			continue
-		}
-
-		categoryCounts[file.Category]++
+	workerCount := optDLWorkers
+	if workerCount <= 0 {
+		workerCount = 1
 	}
+	if workerCount > totalFilesToDownload {
+		workerCount = totalFilesToDownload
+	}
+
+	for w := 0; w < workerCount; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for file := range jobs {
+				idx := int(atomic.AddInt32(&fileCounter, 1))
+				if maxRuntime > 0 && time.Since(startTime) > maxRuntime {
+					continue
+				}
+				if optMaxBytesTarget > 0 {
+					current := atomic.LoadInt64(&bytesDownloaded)
+					if current >= optMaxBytesTarget {
+						fmt.Printf("[LIMIT] Reached max-bytes-target (%d), skipping remaining downloads\n", optMaxBytesTarget)
+						continue
+					}
+				}
+
+				baseDir := filepath.Join(optOutputDir, domainFolder)
+				fullPath := windowsFriendlyPath(filepath.Join(baseDir, file.Filename))
+
+				dirPath := filepath.Dir(fullPath)
+				if err := os.MkdirAll(dirPath, 0755); err != nil {
+					fmt.Printf("[WARN] Failed to create directory %s: %v\n", dirPath, err)
+					continue
+				}
+
+				remainingBudget := int64(0)
+				if optMaxBytesTarget > 0 {
+					current := atomic.LoadInt64(&bytesDownloaded)
+					remainingBudget = optMaxBytesTarget - current
+					if remainingBudget <= 0 {
+						fmt.Printf("[LIMIT] Reached max-bytes-target (%d), skipping remaining downloads\n", optMaxBytesTarget)
+						continue
+					}
+				}
+
+				written, meta, err := downloadFileWithRetry(client, file, fullPath, optDLRetries, idx, totalFilesToDownload, remainingBudget)
+				if err != nil {
+					fmt.Printf("[WARN] Failed to download %s after retries: %v\n", file.URL, err)
+					continue
+				}
+
+				if written > 0 {
+					atomic.AddInt64(&bytesDownloaded, written)
+				}
+
+				catMu.Lock()
+				categoryCounts[file.Category]++
+				catMu.Unlock()
+
+				if meta != nil {
+					metaMu.Lock()
+					downloadMeta[file.URL] = *meta
+					metaMu.Unlock()
+				}
+			}
+		}(w)
+	}
+
+	for _, file := range filesToDownload {
+		jobs <- file
+	}
+	close(jobs)
+	
+	wg.Wait()
 
 	// Print summary
 	fmt.Printf("[SUMMARY] Downloaded: ")
-	first := true
-	for cat, count := range categoryCounts {
-		if !first {
+	cats := make([]string, 0, len(categoryCounts))
+	for cat := range categoryCounts {
+		cats = append(cats, cat)
+	}
+	sort.Strings(cats)
+	for i, cat := range cats {
+		if i > 0 {
 			fmt.Print(" | ")
 		}
-		fmt.Printf("%s: %d", cat, count)
-		first = false
+		fmt.Printf("%s: %d", cat, categoryCounts[cat])
 	}
 	fmt.Println()
 
-	return nil
+	if optMaxBytesTarget > 0 {
+		fmt.Printf("[SUMMARY] Bytes downloaded (approx): %d\n", atomic.LoadInt64(&bytesDownloaded))
+	}
+
+	return atomic.LoadInt64(&bytesDownloaded), downloadMeta, nil
 }
 
 type ProgressWriter struct {
@@ -719,25 +896,40 @@ func parsePorts(portsStr string) []string {
 	return ports
 }
 
-func checkTorConnection() bool {
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-		Transport: &http.Transport{
-			Dial: func(network, addr string) (net.Conn, error) {
-				dialer, _ := proxy.SOCKS5("tcp", "127.0.0.1:9050", nil, proxy.Direct)
-				return dialer.Dial(network, addr)
+func checkTorConnection(ports []string) bool {
+	if len(ports) == 0 {
+		ports = []string{"9050"}
+	}
+
+	for _, port := range ports {
+		client := &http.Client{
+			Timeout: 30 * time.Second,
+			Transport: &http.Transport{
+				Dial: func(network, addr string) (net.Conn, error) {
+					dialer, err := proxy.SOCKS5("tcp", "127.0.0.1:"+port, nil, proxy.Direct)
+					if err != nil {
+						return nil, err
+					}
+					return dialer.Dial(network, addr)
+				},
 			},
-		},
+		}
+
+		resp, err := client.Get("http://check.torproject.org")
+		if err != nil {
+			fmt.Printf("[CHECK] Tor check failed via port %s: %v\n", port, err)
+			continue
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if strings.Contains(string(body), "Congratulations") {
+			fmt.Printf("[CHECK] Tor OK via port %s\n", port)
+			return true
+		}
+		fmt.Printf("[CHECK] Tor check did not confirm Tor via port %s\n", port)
 	}
 
-	resp, err := client.Get("http://check.torproject.org")
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-	return strings.Contains(string(body), "Congratulations")
+	return false
 }
 
 func loadTargets(filename string) []string {
@@ -758,12 +950,13 @@ func loadTargets(filename string) []string {
 	return targets
 }
 
-func getTorProfilePath() string {
+
+func getTorProfilePath(workerID int) string {
 	tmpDir := os.TempDir()
-	return filepath.Join(tmpDir, "playwright_tor_profile")
+	return filepath.Join(tmpDir, fmt.Sprintf("playwright_tor_profile_w%d", workerID))
 }
 
-func saveFileMetadata(onionAddr string, data *ScrapedData) error {
+func saveFileMetadata(onionAddr string, data *ScrapedData, dlMeta map[string]DownloadedMeta) error {
 	// Extract domain for folder structure
 	domainFolder := extractDomainForFolder(onionAddr)
 	
@@ -780,21 +973,30 @@ func saveFileMetadata(onionAddr string, data *ScrapedData) error {
 	
 	// Build metadata structure
 	type FileMeta struct {
-		URL      string `json:"url"`
-		Category string `json:"category"`
-		Filename string `json:"filename"`
-		RelPath  string `json:"rel_path"`  // Category/Domain/Subpath/Filename
+		URL         string `json:"url"`
+		Category    string `json:"category"`
+		Filename    string `json:"filename"`
+		RelPath     string `json:"rel_path"`
+		FinalURL    string `json:"final_url,omitempty"`
+		ContentType string `json:"content_type,omitempty"`
+		Size        int64  `json:"size,omitempty"`
+		SHA256      string `json:"sha256,omitempty"`
 	}
 	
 	var metadata []FileMeta
 	for _, file := range data.files {
 		// New structure: domainFolder/subpath/filename (no category folder)
 		relPath := filepath.Join(domainFolder, file.Filename)
+		dm := dlMeta[file.URL]
 		metadata = append(metadata, FileMeta{
-			URL:      file.URL,
-			Category: file.Category,
-			Filename: file.Filename,
-			RelPath:  relPath,
+			URL:         file.URL,
+			Category:    file.Category,
+			Filename:    file.Filename,
+			RelPath:     relPath,
+			FinalURL:    dm.FinalURL,
+			ContentType: dm.ContentType,
+			Size:        dm.Size,
+			SHA256:      dm.SHA256,
 		})
 	}
 	
@@ -807,10 +1009,13 @@ func saveFileMetadata(onionAddr string, data *ScrapedData) error {
 	return os.WriteFile(metaFile, jsonData, 0644)
 }
 
-func logSuccess(onionAddr string, data *ScrapedData) {
+func logSuccess(onionAddr string, data *ScrapedData, bytesDownloaded int64, dlMeta map[string]DownloadedMeta) {
 	// Also save detailed metadata for file organization
-	if err := saveFileMetadata(onionAddr, data); err != nil {
+	if err := saveFileMetadata(onionAddr, data, dlMeta); err != nil {
 		fmt.Printf("[WARN] Failed to save metadata for %s: %v\n", onionAddr, err)
+	}
+	if err := saveTargetSummary(onionAddr, data, bytesDownloaded); err != nil {
+		fmt.Printf("[WARN] Failed to save summary for %s: %v\n", onionAddr, err)
 	}
 	
 	f, err := os.OpenFile(optLogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -819,7 +1024,38 @@ func logSuccess(onionAddr string, data *ScrapedData) {
 	}
 	defer f.Close()
 	logger := log.New(f, "", log.LstdFlags)
-	logger.Printf("[SUCCESS] %s - %d files - %s", onionAddr, len(data.files), data.pageTitle)
+	logger.Printf("[SUCCESS] %s - %d files - %d bytes - %s", onionAddr, len(data.files), bytesDownloaded, data.pageTitle)
+}
+
+func saveTargetSummary(onionAddr string, data *ScrapedData, bytesDownloaded int64) error {
+	domainFolder := extractDomainForFolder(onionAddr)
+	metaDir := filepath.Join(optOutputDir, "metadata")
+	if err := os.MkdirAll(metaDir, 0755); err != nil {
+		return err
+	}
+	safeDomain := strings.ReplaceAll(domainFolder, ":", "_")
+	safeDomain = strings.ReplaceAll(safeDomain, "/", "_")
+	summaryFile := filepath.Join(metaDir, safeDomain+"_summary.json")
+
+	type Summary struct {
+		Target         string `json:"target"`
+		Title          string `json:"title"`
+		FilesDetected  int    `json:"files_detected"`
+		BytesDownloaded int64 `json:"bytes_downloaded"`
+	}
+
+	s := Summary{
+		Target:         onionAddr,
+		Title:          data.pageTitle,
+		FilesDetected:  len(data.files),
+		BytesDownloaded: bytesDownloaded,
+	}
+
+	jsonData, err := json.MarshalIndent(s, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(summaryFile, jsonData, 0644)
 }
 
 func logFailure(onionAddr string, err error) {
@@ -845,29 +1081,54 @@ func randomDelay(min, max int) time.Duration {
 	return time.Duration(delay * float64(time.Minute))
 }
 // downloadFileWithRetry downloads a file with retry logic and resume support
-func downloadFileWithRetry(client *http.Client, file FileInfo, fullPath string, maxRetries int, fileIndex int, totalFiles int) error {
+func downloadFileWithRetry(client *http.Client, file FileInfo, fullPath string, maxRetries int, fileIndex int, totalFiles int, remainingTargetBudget int64) (int64, *DownloadedMeta, error) {
 	const TorUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) Gecko/20100101 Firefox/140.0"
 	label := strings.ToUpper(file.Category)
 	filename := filepath.Base(file.Filename)
+	partPath := fullPath + ".part"
+
+	if maxRetries <= 0 {
+		maxRetries = 1
+	}
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		if attempt > 0 {
 			fmt.Printf("[RETRY] %s: attempt %d/%d\n", filename, attempt+1, maxRetries)
-			time.Sleep(2 * time.Second) // Short, consistent delay
+			sleep := time.Duration(1<<min(attempt, 6)) * time.Second
+			if sleep > 60*time.Second {
+				sleep = 60 * time.Second
+			}
+			time.Sleep(sleep)
 		}
 
 		// Check existing file size for resume
 		var startOffset int64 = 0
-		if info, err := os.Stat(fullPath); err == nil {
+		if info, err := os.Stat(partPath); err == nil {
 			startOffset = info.Size()
 			if startOffset > 0 {
 				fmt.Printf("[RESUME] %s: resuming from %d KB\n", filename, startOffset/1024)
 			}
 		}
 
+		if optDLPreflight {
+			ct, cl, finalURL, ok := preflightDownload(client, file.URL)
+			if ok {
+				if optMaxBytesFile > 0 && cl > 0 && cl+startOffset > optMaxBytesFile {
+					return 0, nil, fmt.Errorf("file exceeds max-bytes-file (%d)", optMaxBytesFile)
+				}
+				if remainingTargetBudget > 0 && cl > 0 && cl+startOffset > remainingTargetBudget {
+					return 0, nil, fmt.Errorf("file exceeds remaining max-bytes-target budget (%d)", remainingTargetBudget)
+				}
+				if shouldRejectContentType(file.Category, ct) {
+					return 0, nil, fmt.Errorf("rejected by content-type preflight: %s", ct)
+				}
+				_ = finalURL
+			}
+		}
+
 		req, err := http.NewRequest("GET", file.URL, nil)
 		if err != nil {
-			return err
+			return 0, nil, err
 		}
 		req.Header.Set("User-Agent", TorUA)
 		if startOffset > 0 {
@@ -883,14 +1144,27 @@ func downloadFileWithRetry(client *http.Client, file FileInfo, fullPath string, 
 		// If server doesn't support resume, restart from beginning
 		if startOffset > 0 && resp.StatusCode != http.StatusPartialContent {
 			startOffset = 0
-			os.Remove(fullPath) // Remove partial file
+			os.Remove(partPath)
 			resp.Body.Close()
 			continue // Retry from beginning
 		}
 
 		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
 			resp.Body.Close()
-			return fmt.Errorf("non-200 status: %s", resp.Status)
+			return 0, nil, fmt.Errorf("non-200 status: %s", resp.Status)
+		}
+		if shouldRejectContentType(file.Category, resp.Header.Get("Content-Type")) {
+			resp.Body.Close()
+			return 0, nil, fmt.Errorf("rejected by content-type: %s", resp.Header.Get("Content-Type"))
+		}
+
+		if optMaxBytesFile > 0 && resp.ContentLength > 0 && resp.ContentLength+startOffset > optMaxBytesFile {
+			resp.Body.Close()
+			return 0, nil, fmt.Errorf("file exceeds max-bytes-file (%d)", optMaxBytesFile)
+		}
+		if remainingTargetBudget > 0 && resp.ContentLength > 0 && resp.ContentLength+startOffset > remainingTargetBudget {
+			resp.Body.Close()
+			return 0, nil, fmt.Errorf("file exceeds remaining max-bytes-target budget (%d)", remainingTargetBudget)
 		}
 
 		// Open file for writing (append if resuming)
@@ -898,10 +1172,10 @@ func downloadFileWithRetry(client *http.Client, file FileInfo, fullPath string, 
 		if startOffset > 0 {
 			flag = os.O_APPEND | os.O_WRONLY
 		}
-		out, err := os.OpenFile(fullPath, flag, 0644)
+		out, err := os.OpenFile(partPath, flag, 0644)
 		if err != nil {
 			resp.Body.Close()
-			return err
+			return 0, nil, err
 		}
 
 		pw := &ProgressWriter{
@@ -913,7 +1187,17 @@ func downloadFileWithRetry(client *http.Client, file FileInfo, fullPath string, 
 			TotalFiles:  totalFiles,
 		}
 
-		_, err = io.Copy(out, io.TeeReader(resp.Body, pw))
+		reader := io.Reader(resp.Body)
+		if optMaxBytesFile > 0 {
+			reader = io.LimitReader(reader, optMaxBytesFile-startOffset+1)
+		}
+		if remainingTargetBudget > 0 {
+			reader = io.LimitReader(reader, remainingTargetBudget-startOffset+1)
+		}
+
+		h := sha256.New()
+		mw := io.MultiWriter(pw, h)
+		written, err := io.Copy(out, io.TeeReader(reader, mw))
 		out.Close()
 		resp.Body.Close()
 		fmt.Println()
@@ -923,10 +1207,89 @@ func downloadFileWithRetry(client *http.Client, file FileInfo, fullPath string, 
 			continue // Retry
 		}
 
-		return nil // Success
+		finalSize := startOffset + written
+		if optMaxBytesFile > 0 && finalSize > optMaxBytesFile {
+			os.Remove(partPath)
+			return 0, nil, fmt.Errorf("download exceeded max-bytes-file (%d)", optMaxBytesFile)
+		}
+		if remainingTargetBudget > 0 && finalSize > remainingTargetBudget {
+			os.Remove(partPath)
+			return 0, nil, fmt.Errorf("download exceeded remaining max-bytes-target budget (%d)", remainingTargetBudget)
+		}
+
+		os.Remove(fullPath)
+		if err := os.Rename(partPath, fullPath); err != nil {
+			return 0, nil, err
+		}
+
+		sum := hex.EncodeToString(h.Sum(nil))
+		finalURL := ""
+		if resp != nil && resp.Request != nil && resp.Request.URL != nil {
+			finalURL = resp.Request.URL.String()
+		}
+		meta := &DownloadedMeta{
+			FinalURL:    finalURL,
+			ContentType: resp.Header.Get("Content-Type"),
+			Size:        finalSize,
+			SHA256:      sum,
+		}
+
+		return finalSize - startOffset, meta, nil
 	}
 
-	return fmt.Errorf("failed after %d attempts", maxRetries)
+	return 0, nil, fmt.Errorf("failed after %d attempts", maxRetries)
+}
+
+func preflightDownload(client *http.Client, u string) (contentType string, contentLength int64, finalURL string, ok bool) {
+	req, err := http.NewRequest("HEAD", u, nil)
+	if err == nil {
+		resp, err := client.Do(req)
+		if err == nil {
+			resp.Body.Close()
+			if resp.Request != nil && resp.Request.URL != nil {
+				finalURL = resp.Request.URL.String()
+			}
+			return resp.Header.Get("Content-Type"), resp.ContentLength, finalURL, true
+		}
+	}
+
+	// Fallback: Range GET for 1 byte to harvest headers
+	req, err = http.NewRequest("GET", u, nil)
+	if err != nil {
+		return "", 0, "", false
+	}
+	req.Header.Set("Range", "bytes=0-0")
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", 0, "", false
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.Request != nil && resp.Request.URL != nil {
+		finalURL = resp.Request.URL.String()
+	}
+	return resp.Header.Get("Content-Type"), resp.ContentLength, finalURL, true
+}
+
+func shouldRejectContentType(category, contentType string) bool {
+	ct := strings.ToLower(strings.TrimSpace(contentType))
+	if ct == "" {
+		return false
+	}
+	if strings.Contains(ct, "text/html") {
+		switch category {
+		case "documents", "archives", "audio", "images", "videos", "executables":
+			return true
+		}
+	}
+	return false
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 func extractDomainForFolder(urlStr string) string {
 	// If it has a protocol, parse it
@@ -982,6 +1345,10 @@ func extractFileLinks(page playwright.Page, baseURL string, data *ScrapedData, c
 
 		// Check if already captured
 		resMu.Lock()
+		if optMaxFiles > 0 && len(data.files) >= optMaxFiles {
+			resMu.Unlock()
+			return
+		}
 		if capturedFiles[fullURL] {
 			resMu.Unlock()
 			continue
@@ -993,8 +1360,6 @@ func extractFileLinks(page playwright.Page, baseURL string, data *ScrapedData, c
 			resMu.Unlock()
 			continue
 		}
-
-		capturedFiles[fullURL] = true
 		resMu.Unlock()
 
 		filename := generateFilename(fullURL, category)
@@ -1004,7 +1369,147 @@ func extractFileLinks(page playwright.Page, baseURL string, data *ScrapedData, c
 			Filename: filename,
 		}
 
+		resMu.Lock()
+		if optMaxFiles > 0 && len(data.files) >= optMaxFiles {
+			resMu.Unlock()
+			return
+		}
+		if capturedFiles[fullURL] {
+			resMu.Unlock()
+			continue
+		}
+		capturedFiles[fullURL] = true
 		data.files = append(data.files, info)
+		resMu.Unlock()
+
 		fmt.Printf("[FOUND] [%s] %s\n", category, filepath.Base(filename))
 	}
+}
+
+func captureFileURL(fileURL string, data *ScrapedData, capturedFiles map[string]bool, resMu *sync.Mutex) {
+	lowerURL := strings.ToLower(fileURL)
+	category := detectCategory(lowerURL)
+	if category == "" {
+		return
+	}
+
+	resMu.Lock()
+	if optMaxFiles > 0 && len(data.files) >= optMaxFiles {
+		resMu.Unlock()
+		return
+	}
+	if capturedFiles[fileURL] {
+		resMu.Unlock()
+		return
+	}
+	capturedFiles[fileURL] = true
+	resMu.Unlock()
+
+	filename := generateFilename(fileURL, category)
+	info := FileInfo{URL: fileURL, Category: category, Filename: filename}
+
+	resMu.Lock()
+	if optMaxFiles > 0 && len(data.files) >= optMaxFiles {
+		resMu.Unlock()
+		return
+	}
+	data.files = append(data.files, info)
+	resMu.Unlock()
+
+	fmt.Printf("[FOUND] [%s] %s\n", category, filepath.Base(filename))
+}
+
+func parseCSVSet(s string) map[string]bool {
+	out := make(map[string]bool)
+	for _, part := range strings.Split(s, ",") {
+		p := strings.ToLower(strings.TrimSpace(part))
+		if p == "" {
+			continue
+		}
+		out[p] = true
+	}
+	return out
+}
+
+func hasAnyQueryKey(rawURL string, deny map[string]bool) bool {
+	if len(deny) == 0 {
+		return false
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	q := u.Query()
+	for k := range q {
+		if deny[strings.ToLower(k)] {
+			return true
+		}
+	}
+	return false
+}
+
+func canonicalHost(u *url.URL) string {
+	host := strings.ToLower(u.Host)
+	if host == "" {
+		return ""
+	}
+	// If host contains port, normalize and remove default ports
+	h, p, err := net.SplitHostPort(host)
+	if err != nil {
+		return host
+	}
+	if (u.Scheme == "http" && p == "80") || (u.Scheme == "https" && p == "443") {
+		return h
+	}
+	return net.JoinHostPort(h, p)
+}
+
+func canonicalizeForVisit(rawURL string, deny map[string]bool) (string, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "", err
+	}
+	if u.Scheme == "" {
+		// Default to http for onion targets
+		u.Scheme = "http"
+	}
+	u.Fragment = ""
+
+	// Drop query for dedupe/crawl stability; denyQueryKeys is enforced separately.
+	u.RawQuery = ""
+
+	h := canonicalHost(u)
+	if h == "" {
+		return "", fmt.Errorf("missing host")
+	}
+	u.Host = h
+
+	cleaned := path.Clean(u.Path)
+	if cleaned == "." {
+		cleaned = "/"
+	}
+	// Preserve trailing slash when it was explicit and not root
+	if strings.HasSuffix(u.Path, "/") && cleaned != "/" {
+		cleaned += "/"
+	}
+	u.Path = cleaned
+
+	return u.String(), nil
+}
+
+func dumpPageFailure(onionAddr string, page playwright.Page, reason string) error {
+	domainFolder := extractDomainForFolder(onionAddr)
+	safeDomain := strings.ReplaceAll(domainFolder, ":", "_")
+	safeDomain = strings.ReplaceAll(safeDomain, "/", "_")
+	baseDir := filepath.Join(optOutputDir, "metadata", "failures", safeDomain)
+	if err := os.MkdirAll(baseDir, 0755); err != nil {
+		return err
+	}
+	stamp := time.Now().Format("20060102_150405")
+	base := filepath.Join(baseDir, stamp+"_"+reason)
+	_, _ = page.Screenshot(playwright.PageScreenshotOptions{Path: playwright.String(base + ".png"), FullPage: playwright.Bool(true)})
+	if html, err := page.Content(); err == nil {
+		_ = os.WriteFile(base+".html", []byte(html), 0644)
+	}
+	return nil
 }
