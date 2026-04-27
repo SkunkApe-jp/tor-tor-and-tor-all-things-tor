@@ -9,10 +9,12 @@ import sys
 import argparse
 from pathlib import Path
 
-# Captures optional http/https + the hash + .onion + any proxy suffixes
-URL_PATTERN = r'((?:https?://)?[a-z2-7]{14,56}\.onion(?:\.[a-z0-9.]+)*)'
+# Captures optional http/https + the hash + .onion + any proxy suffixes (strips paths)
+URL_PATTERN_STRIP = r'((?:https?://)?[a-z2-7]{14,56}\.onion(?:\.[a-z0-9.]+)*)'
+# Captures full URL including sub-paths
+URL_PATTERN_KEEP = r'((?:https?://)?[a-z2-7]{14,56}\.onion(?:\.[a-z0-9.]+)*[^\s]*)'
 
-def process_file(input_path):
+def process_file(input_path, keep_paths=False):
     path = Path(input_path)
     if not path.exists():
         print(f"[-] Error: File '{input_path}' not found.")
@@ -28,7 +30,8 @@ def process_file(input_path):
         # Clean up YAML syntax: dashes, spaces, and quotes
         line = line.strip().lstrip('- ').strip('"').strip("'")
         
-        match = re.search(URL_PATTERN, line, re.IGNORECASE)
+        pattern = URL_PATTERN_KEEP if keep_paths else URL_PATTERN_STRIP
+        match = re.search(pattern, line, re.IGNORECASE)
         if match:
             full_url = match.group(1)
             
@@ -43,10 +46,10 @@ def process_file(input_path):
 
 def main():
     parser = argparse.ArgumentParser(description="Split onion links into Clean and Proxied files.")
-    parser.add_argument("--input", help="The text file to scan")
+    parser.add_argument("--keep-paths", action="store_true", help="Preserve sub-paths in extracted URLs (e.g., /path/to/page)")
     args = parser.parse_args()
 
-    clean, proxied = process_file(args.input)
+    clean, proxied = process_file(args.input, keep_paths=args.keep_paths)
     if clean is None: return
 
     # Define output paths
